@@ -1,0 +1,47 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model Product {
+  id          String   @id @default(uuid())
+  name        String
+  sku         String   @unique
+  price       Float
+  minThreshold Int     // Alert if stock drops below this
+  shelf       Shelf?   @relation(fields: [shelfId], references: [id])
+  shelfId     String?
+  stock       Int      @default(0) // System Count (The "Book" value)
+  updatedAt   DateTime @updatedAt
+  auditLogs   AuditLog[]
+}
+
+model Shelf {
+  id          String    @id @default(uuid())
+  label       String    @unique // e.g., "Aisle-4-B"
+  products    Product[]
+  lastScanned DateTime?
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id])
+  systemCount Int      // What the DB said
+  visualCount Int      // What the AI saw
+  discrepancy Int      // The difference
+  imageUrl    String?  // Reference to the snapshot
+  createdAt   DateTime @default(now())
+}
