@@ -1,8 +1,8 @@
 // src/controllers/productController.ts
 import { Request, Response } from 'express';
 import { ProductService } from '../services/productService';
-import { logger } from '../utils/logger';
 import { asyncHandler } from '../middleware/errorHandler';
+import { logger } from '../utils/logger';
 
 export class ProductController {
   /**

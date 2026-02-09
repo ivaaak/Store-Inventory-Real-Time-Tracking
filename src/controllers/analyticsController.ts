@@ -1,8 +1,8 @@
 // src/controllers/analyticsController.ts
 import { Request, Response } from 'express';
 import { AnalyticsService } from '../services/analyticsService';
-import { logger } from '../utils/logger';
 import { asyncHandler } from '../middleware/errorHandler';
+import { logger } from '../utils/logger';
 
 export class AnalyticsController {
   /**
