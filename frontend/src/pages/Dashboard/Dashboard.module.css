@@ -1,0 +1,250 @@
+.container {
+  padding: var(--spacing-lg);
+  min-height: 100vh;
+}
+
+.header {
+  margin-bottom: var(--spacing-lg);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.title {
+  font-size: 28px;
+  font-weight: 700;
+}
+
+.timestamp {
+  font-size: 14px;
+  color: var(--color-text-secondary);
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: var(--spacing-md);
+  margin-bottom: var(--spacing-lg);
+}
+
+.metricCard {
+  background-color: white;
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius);
+  padding: var(--spacing-lg);
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  transition: all 0.2s ease;
+}
+
+.metricCard:hover {
+  box-shadow: var(--shadow-md);
+}
+
+.metricIcon {
+  font-size: 40px;
+}
+
+.metricContent {
+  flex: 1;
+}
+
+.metricValue {
+  font-size: 32px;
+  font-weight: 700;
+  color: var(--color-text);
+  line-height: 1;
+  margin-bottom: var(--spacing-xs);
+}
+
+.metricLabel {
+  font-size: 14px;
+  color: var(--color-text-secondary);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+  gap: var(--spacing-lg);
+  margin-bottom: var(--spacing-lg);
+}
+
+.panel {
+  background-color: white;
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius);
+  padding: var(--spacing-lg);
+}
+
+.panelHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--spacing-md);
+}
+
+.panelTitle {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.link {
+  font-size: 14px;
+  color: var(--color-primary);
+  text-decoration: none;
+  font-weight: 500;
+  transition: color 0.2s ease;
+}
+
+.link:hover {
+  color: var(--color-primary-dark);
+}
+
+.alertsList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.alertItem {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  padding: var(--spacing-md);
+  border-radius: var(--border-radius-sm);
+  background-color: var(--color-bg-secondary);
+  transition: all 0.2s ease;
+}
+
+.alertItem:hover {
+  background-color: var(--color-bg-tertiary);
+}
+
+.alertSeverity {
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.severityCRITICAL {
+  background-color: rgba(239, 68, 68, 0.1);
+  color: var(--color-danger);
+}
+
+.severityHIGH {
+  background-color: rgba(245, 158, 11, 0.1);
+  color: var(--color-warning);
+}
+
+.severityMEDIUM {
+  background-color: rgba(59, 130, 246, 0.1);
+  color: var(--color-info);
+}
+
+.alertContent {
+  flex: 1;
+}
+
+.alertType {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text);
+  text-transform: capitalize;
+  margin-bottom: 2px;
+}
+
+.alertDetails {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+.alertTime {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
+.auditsList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.auditItem {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  align-items: center;
+  gap: var(--spacing-md);
+  padding: var(--spacing-md);
+  border-radius: var(--border-radius-sm);
+  background-color: var(--color-bg-secondary);
+  transition: all 0.2s ease;
+}
+
+.auditItem:hover {
+  background-color: var(--color-bg-tertiary);
+}
+
+.auditShelf {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.auditStatus {
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: capitalize;
+}
+
+.statusphantom {
+  background-color: rgba(239, 68, 68, 0.1);
+  color: var(--color-danger);
+}
+
+.statusmatch {
+  background-color: rgba(16, 185, 129, 0.1);
+  color: var(--color-success);
+}
+
+.statusdiscrepancy {
+  background-color: rgba(245, 158, 11, 0.1);
+  color: var(--color-warning);
+}
+
+.auditConfidence {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+.auditTime {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
+.chartPlaceholder {
+  height: 300px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--color-bg-secondary);
+  border-radius: var(--border-radius);
+  border: 2px dashed var(--color-border);
+}
+
+.chartIcon {
+  font-size: 48px;
+  margin-bottom: var(--spacing-md);
+  opacity: 0.3;
+}
+
+.chartText {
+  font-size: 14px;
+  color: var(--color-text-secondary);
+}
