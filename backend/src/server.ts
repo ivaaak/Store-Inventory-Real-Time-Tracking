@@ -3,51 +3,48 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import app from './app';
+import { prisma } from './lib/prisma';
+import { getVisionProvider } from './services/visionService';
 import { logger } from './utils/logger';
-import { PrismaClient } from '@prisma/client';
 
-const PORT = process.env.PORT || 3000;
-const prisma = new PrismaClient();
+const PORT = Number(process.env.PORT) || 3000;
 
-// Test database connection
-async function connectDatabase() {
+async function startServer() {
   try {
     await prisma.$connect();
     logger.info('Database connected successfully');
-  } catch (error) {
-    logger.error('Failed to connect to database', { error });
+  } catch (error: any) {
+    logger.error('Failed to connect to database', { error: error.message });
     process.exit(1);
   }
-}
-
-// Start server
-async function startServer() {
-  await connectDatabase();
 
   const server = app.listen(PORT, () => {
     logger.info(`Server is running on port ${PORT}`);
     logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
+    logger.info(`Vision provider: ${getVisionProvider() ?? 'disabled (set OPENAI_API_KEY or VISION_PROVIDER=mock)'}`);
     logger.info(`Health check: http://localhost:${PORT}/health`);
   });
 
-  // Graceful shutdown
-  const gracefulShutdown = async (signal: string) => {
+  let shuttingDown = false;
+  const gracefulShutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info(`${signal} received. Starting graceful shutdown...`);
-    
+
     server.close(async () => {
-      logger.info('HTTP server closed');
-      
       await prisma.$disconnect();
-      logger.info('Database connection closed');
-      
+      logger.info('HTTP server and database connection closed');
       process.exit(0);
     });
 
-    // Force shutdown after 10 seconds
+    // Live-event (SSE) streams never finish on their own; give in-flight
+    // requests a moment, then drop remaining connections.
+    setTimeout(() => server.closeAllConnections(), 3_000).unref();
+
     setTimeout(() => {
       logger.error('Forced shutdown due to timeout');
       process.exit(1);
-    }, 10000);
+    }, 10_000).unref();
   };
 
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
@@ -55,6 +52,6 @@ async function startServer() {
 }
 
 startServer().catch((error) => {
-  logger.error('Failed to start server', { error });
+  logger.error('Failed to start server', { error: error?.message });
   process.exit(1);
 });

@@ -4,13 +4,19 @@ import { AnalyticsService } from '../services/analyticsService';
 import { asyncHandler } from '../middleware/errorHandler';
 import { logger } from '../utils/logger';
 
+/** Parse a `days` query parameter, clamped to a sane range. */
+const parseDays = (value: unknown, fallback: number): number => {
+  const n = Math.floor(Number(value));
+  return Number.isFinite(n) && n > 0 ? Math.min(n, 365) : fallback;
+};
+
 export class AnalyticsController {
   /**
    * GET /api/analytics/dashboard
    * Get dashboard overview
    */
   static getDashboardOverview = asyncHandler(async (req: Request, res: Response) => {
-    const days = req.query.days ? Number(req.query.days) : 7;
+    const days = parseDays(req.query.days, 7);
 
     logger.info('Fetching dashboard overview', { days });
 
@@ -26,7 +32,7 @@ export class AnalyticsController {
    * Get alert trends over time
    */
   static getAlertTrends = asyncHandler(async (req: Request, res: Response) => {
-    const days = req.query.days ? Number(req.query.days) : 30;
+    const days = parseDays(req.query.days, 30);
 
     logger.info('Fetching alert trends', { days });
 
@@ -43,7 +49,7 @@ export class AnalyticsController {
    * Get stock movement analysis
    */
   static getStockMovement = asyncHandler(async (req: Request, res: Response) => {
-    const days = req.query.days ? Number(req.query.days) : 30;
+    const days = parseDays(req.query.days, 30);
 
     logger.info('Analyzing stock movement', { days });
 
@@ -60,7 +66,7 @@ export class AnalyticsController {
    * Get audit performance metrics
    */
   static getAuditPerformance = asyncHandler(async (req: Request, res: Response) => {
-    const days = req.query.days ? Number(req.query.days) : 30;
+    const days = parseDays(req.query.days, 30);
 
     logger.info('Calculating audit performance', { days });
 
@@ -77,7 +83,7 @@ export class AnalyticsController {
    * Get phantom stock hotspots
    */
   static getPhantomHotspots = asyncHandler(async (req: Request, res: Response) => {
-    const days = req.query.days ? Number(req.query.days) : 30;
+    const days = parseDays(req.query.days, 30);
 
     logger.info('Identifying phantom hotspots', { days });
 
@@ -108,7 +114,7 @@ export class AnalyticsController {
    * Generate comprehensive analytics report
    */
   static generateReport = asyncHandler(async (req: Request, res: Response) => {
-    const days = req.query.days ? Number(req.query.days) : 30;
+    const days = parseDays(req.query.days, 30);
 
     logger.info('Generating analytics report', { days });
 

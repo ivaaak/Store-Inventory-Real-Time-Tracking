@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 import { ShelfService } from '../services/shelfService';
 import { logger } from '../utils/logger';
 import { asyncHandler } from '../middleware/errorHandler';
+import { CreateShelfInput, UpdateShelfConfigInput, UpdateShelfInput } from '../validation/schemas';
 
 export class ShelfController {
   /**
@@ -10,21 +11,7 @@ export class ShelfController {
    * Create a new shelf
    */
   static createShelf = asyncHandler(async (req: Request, res: Response) => {
-    const { label, zone, cameraUrl } = req.body;
-
-    if (!label) {
-      return res.status(400).json({
-        error: 'Shelf label is required'
-      });
-    }
-
-    logger.info('Creating new shelf', { label, zone });
-
-    const shelf = await ShelfService.createShelf({
-      label,
-      zone,
-      cameraUrl
-    });
+    const shelf = await ShelfService.createShelf(req.body as CreateShelfInput);
 
     return res.status(201).json({
       message: 'Shelf created successfully',
@@ -38,11 +25,7 @@ export class ShelfController {
    */
   static updateShelf = asyncHandler(async (req: Request, res: Response) => {
     const { label } = req.params;
-    const updates = req.body;
-
-    logger.info('Updating shelf', { label });
-
-    const shelf = await ShelfService.updateShelf(label, updates);
+    const shelf = await ShelfService.updateShelf(label, req.body as UpdateShelfInput);
 
     return res.status(200).json({
       message: 'Shelf updated successfully',
@@ -94,24 +77,15 @@ export class ShelfController {
    * List all shelves
    */
   static listShelves = asyncHandler(async (req: Request, res: Response) => {
-    const { zone, limit, offset } = req.query;
+    const zone = req.query.zone as string | undefined;
+    const limit = Math.min(Number(req.query.limit) || 100, 500);
+    const offset = Number(req.query.offset) || 0;
 
-    logger.info('Listing shelves', { zone });
-
-    const { shelves, total } = await ShelfService.listShelves({
-      zone: zone as string,
-      limit: limit ? Number(limit) : undefined,
-      offset: offset ? Number(offset) : undefined
-    });
+    const { shelves, total } = await ShelfService.listShelves({ zone, limit, offset });
 
     return res.status(200).json({
       data: shelves,
-      pagination: {
-        total,
-        limit: Number(limit) || 50,
-        offset: Number(offset) || 0,
-        hasMore: total > (Number(offset) || 0) + (Number(limit) || 50)
-      }
+      pagination: { total, limit, offset, hasMore: total > offset + limit }
     });
   });
 
@@ -126,11 +100,7 @@ export class ShelfController {
 
     const config = await ShelfService.getShelfConfig(label);
 
-    return res.status(200).json({
-      data: config || {
-        message: 'No custom configuration set, using defaults'
-      }
-    });
+    return res.status(200).json({ data: config });
   });
 
   /**
@@ -139,11 +109,7 @@ export class ShelfController {
    */
   static updateShelfConfig = asyncHandler(async (req: Request, res: Response) => {
     const { label } = req.params;
-    const config = req.body;
-
-    logger.info('Updating shelf configuration', { label });
-
-    const updatedConfig = await ShelfService.updateShelfConfig(label, config);
+    const updatedConfig = await ShelfService.updateShelfConfig(label, req.body as UpdateShelfConfigInput);
 
     return res.status(200).json({
       message: 'Configuration updated successfully',
@@ -200,22 +166,14 @@ export class ShelfController {
 
   /**
    * POST /api/shelves/:label/schedule-audit
-   * Schedule a shelf audit
+   * Camera-triggered audits need a job queue and camera integration, neither
+   * of which exists yet. Answer honestly instead of pretending to schedule.
    */
   static scheduleAudit = asyncHandler(async (req: Request, res: Response) => {
-    const { label } = req.params;
-    const { scheduledFor } = req.body;
-
-    logger.info('Scheduling audit', { label, scheduledFor });
-
-    await ShelfService.scheduleAudit(
-      label, 
-      scheduledFor ? new Date(scheduledFor) : undefined
-    );
-
-    return res.status(200).json({
-      message: 'Audit scheduled successfully',
-      scheduledFor: scheduledFor || new Date()
+    return res.status(501).json({
+      error: 'Scheduled audits are not implemented yet',
+      hint: 'Upload a shelf image to POST /api/vision/audit instead.',
+      shelfLabel: req.params.label
     });
   });
 

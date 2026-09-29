@@ -1,8 +1,9 @@
 // src/controllers/inventoryController.ts
 import { Request, Response } from 'express';
+import { prisma } from '../lib/prisma';
 import { InventoryService } from '../services/inventoryService';
 import { asyncHandler } from '../middleware/errorHandler';
-import { logger } from '../utils/logger';
+import { AddStockInput, RecordSaleInput } from '../validation/schemas';
 
 export class InventoryController {
   /**
@@ -10,51 +11,41 @@ export class InventoryController {
    * Triggered when staff scans items onto a specific shelf.
    */
   static addStock = asyncHandler(async (req: Request, res: Response) => {
-    const { sku, quantity, shelfLabel } = req.body;
+    const { sku, quantity, shelfLabel } = req.body as AddStockInput;
 
-    logger.info('Adding stock', { sku, quantity, shelfLabel });
+    const result = await InventoryService.commitStock(sku, quantity, shelfLabel);
 
-    const result = await InventoryService.commitStock(
-      sku, 
-      Number(quantity), 
-      shelfLabel
-    );
-    
     return res.status(200).json({
-      message: "Stock successfully added",
+      message: 'Stock successfully added',
       data: {
         sku: result.sku,
         name: result.name,
         currentStock: result.stock,
-        shelfLabel
-      }
+        shelfLabel,
+      },
     });
   });
 
   /**
    * POST /api/stock/sale
-   * Triggered by a POS Webhook or manual entry when a customer buys an item.
+   * Manual or API sale entry. POS sales arrive through the webhook instead.
    */
   static recordSale = asyncHandler(async (req: Request, res: Response) => {
-    const { sku, quantity, orderId } = req.body;
+    const { sku, quantity, orderId } = req.body as RecordSaleInput;
 
-    logger.info('Recording sale', { sku, quantity, orderId });
+    const product = await InventoryService.subtractStock(sku, quantity, {
+      orderId,
+      source: orderId ? 'API' : 'MANUAL',
+    });
 
-    const product = await InventoryService.subtractStock(
-      sku, 
-      Number(quantity),
-      orderId
-    );
-    
     return res.status(200).json({
-      message: "Sale recorded successfully",
+      message: 'Sale recorded successfully',
       data: {
         sku: product.sku,
         name: product.name,
         remainingStock: product.stock,
         needsRestock: product.stock <= product.minThreshold,
-        belowThreshold: product.stock <= product.minThreshold
-      }
+      },
     });
   });
 
@@ -64,26 +55,17 @@ export class InventoryController {
    */
   static getStock = asyncHandler(async (req: Request, res: Response) => {
     const { sku } = req.params;
-    
-    const { PrismaClient } = await import('@prisma/client');
-    const prisma = new PrismaClient();
 
     const product = await prisma.product.findUnique({
       where: { sku },
       include: {
         shelf: true,
-        auditLogs: {
-          orderBy: { createdAt: 'desc' },
-          take: 1
-        }
-      }
+        auditLogs: { orderBy: { createdAt: 'desc' }, take: 1 },
+      },
     });
 
     if (!product) {
-      return res.status(404).json({ 
-        error: 'Product not found',
-        sku 
-      });
+      return res.status(404).json({ error: 'Product not found', sku });
     }
 
     const latestAudit = product.auditLogs[0];
@@ -95,19 +77,18 @@ export class InventoryController {
         currentStock: product.stock,
         minThreshold: product.minThreshold,
         maxCapacity: product.maxCapacity,
-        shelf: product.shelf ? {
-          label: product.shelf.label,
-          zone: product.shelf.zone
-        } : null,
-        lastAudit: latestAudit ? {
-          systemCount: latestAudit.systemCount,
-          visualCount: latestAudit.visualCount,
-          discrepancy: latestAudit.discrepancy,
-          confidence: latestAudit.confidence,
-          timestamp: latestAudit.createdAt
-        } : null,
-        needsRestock: product.stock <= product.minThreshold
-      }
+        shelf: product.shelf ? { label: product.shelf.label, zone: product.shelf.zone } : null,
+        lastAudit: latestAudit
+          ? {
+              systemCount: latestAudit.systemCount,
+              visualCount: latestAudit.visualCount,
+              discrepancy: latestAudit.discrepancy,
+              confidence: latestAudit.confidence,
+              timestamp: latestAudit.createdAt,
+            }
+          : null,
+        needsRestock: product.stock <= product.minThreshold,
+      },
     });
   });
 
@@ -117,9 +98,7 @@ export class InventoryController {
    */
   static getSalesVelocity = asyncHandler(async (req: Request, res: Response) => {
     const { sku } = req.params;
-    const hoursBack = Number(req.query.hours) || 24;
-
-    logger.info('Getting sales velocity', { sku, hoursBack });
+    const hoursBack = Math.max(1, Number(req.query.hours) || 24);
 
     const velocity = await InventoryService.getSalesVelocity(sku, hoursBack);
 
@@ -128,8 +107,8 @@ export class InventoryController {
         sku,
         hoursAnalyzed: hoursBack,
         totalSold: velocity,
-        averagePerHour: (velocity / hoursBack).toFixed(2)
-      }
+        averagePerHour: Number((velocity / hoursBack).toFixed(2)),
+      },
     });
   });
 }

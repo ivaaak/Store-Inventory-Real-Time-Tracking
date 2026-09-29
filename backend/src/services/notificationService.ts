@@ -3,9 +3,12 @@ import axios from 'axios';
 import { logger } from '../utils/logger';
 import { Alert, Product, AlertSeverity } from '@prisma/client';
 
+const escapeHtml = (value: unknown): string =>
+  String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+
 interface NotificationPayload {
   alert: Alert;
-  product: Product & { shelf?: any };
+  product: Product;
   shelfLabel: string;
 }
 
@@ -13,12 +16,12 @@ export class NotificationService {
   /**
    * Send Slack notification
    */
-  static async sendSlackAlert(payload: NotificationPayload): Promise<void> {
+  static async sendSlackAlert(payload: NotificationPayload): Promise<boolean> {
     const webhookUrl = process.env.SLACK_WEBHOOK_URL;
     
     if (!webhookUrl) {
-      logger.warn('Slack webhook URL not configured');
-      return;
+      logger.debug('Slack webhook URL not configured, skipping');
+      return false;
     }
 
     const { alert, product, shelfLabel } = payload;
@@ -65,8 +68,9 @@ export class NotificationService {
     };
 
     try {
-      await axios.post(webhookUrl, slackMessage);
+      await axios.post(webhookUrl, slackMessage, { timeout: 10_000 });
       logger.info('Slack notification sent', { alertId: alert.id });
+      return true;
     } catch (error) {
       logger.error('Failed to send Slack notification', { error });
       throw error;
@@ -76,15 +80,15 @@ export class NotificationService {
   /**
    * Send SMS alert via Twilio
    */
-  static async sendSmsAlert(payload: NotificationPayload): Promise<void> {
+  static async sendSmsAlert(payload: NotificationPayload): Promise<boolean> {
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     const fromNumber = process.env.TWILIO_FROM_NUMBER;
     const toNumber = process.env.ALERT_SMS_NUMBER;
 
     if (!accountSid || !authToken || !fromNumber || !toNumber) {
-      logger.warn('Twilio not configured, skipping SMS');
-      return;
+      logger.debug('Twilio not configured, skipping SMS');
+      return false;
     }
 
     const { alert, product, shelfLabel } = payload;
@@ -117,6 +121,7 @@ ${alert.message}`;
       );
 
       logger.info('SMS notification sent', { alertId: alert.id });
+      return true;
     } catch (error) {
       logger.error('Failed to send SMS notification', { error });
       throw error;
@@ -126,17 +131,17 @@ ${alert.message}`;
   /**
    * Send Email alert
    */
-  static async sendEmailAlert(payload: NotificationPayload): Promise<void> {
+  static async sendEmailAlert(payload: NotificationPayload): Promise<boolean> {
     const apiKey = process.env.SENDGRID_API_KEY;
     const fromEmail = process.env.EMAIL_FROM;
     const toEmail = process.env.ALERT_EMAIL_TO;
 
     if (!apiKey || !fromEmail || !toEmail) {
-      logger.warn('Email not configured, skipping email notification');
-      return;
+      logger.debug('Email not configured, skipping email notification');
+      return false;
     }
 
-    const { alert, product, shelfLabel } = payload;
+    const { alert, product } = payload;
 
     const emailData = {
       personalizations: [
@@ -167,6 +172,7 @@ ${alert.message}`;
       );
 
       logger.info('Email notification sent', { alertId: alert.id });
+      return true;
     } catch (error) {
       logger.error('Failed to send email notification', { error });
       throw error;
@@ -177,7 +183,8 @@ ${alert.message}`;
    * Generate HTML email template
    */
   private static generateEmailHtml(payload: NotificationPayload): string {
-    const { alert, product, shelfLabel } = payload;
+    const { alert, product } = payload;
+    const shelfLabel = escapeHtml(payload.shelfLabel);
     const color = this.getSeverityColor(alert.severity);
 
     return `
@@ -202,7 +209,7 @@ ${alert.message}`;
           </div>
           <div class="content">
             <div class="field">
-              <span class="label">Product:</span> ${product.name} (SKU: ${product.sku})
+              <span class="label">Product:</span> ${escapeHtml(product.name)} (SKU: ${escapeHtml(product.sku)})
             </div>
             <div class="field">
               <span class="label">Shelf:</span> ${shelfLabel}
@@ -212,7 +219,7 @@ ${alert.message}`;
             </div>
             <div class="field">
               <span class="label">Message:</span><br>
-              ${alert.message}
+              ${escapeHtml(alert.message)}
             </div>
             <div class="field">
               <span class="label">Time:</span> ${alert.createdAt.toLocaleString()}

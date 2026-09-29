@@ -1,9 +1,22 @@
 // src/services/inventoryService.ts
-import { PrismaClient, Product, AlertType, AlertSeverity } from '@prisma/client';
+import { Product, AlertType, AlertSeverity, AuditLog } from '@prisma/client';
+import { prisma } from '../lib/prisma';
+import { publish } from '../lib/events';
 import { logger } from '../utils/logger';
+import { AppError } from '../middleware/errorHandler';
 import { AlertService } from './alertService';
+import { classifyAudit, DEFAULT_SHELF_CONFIG, lowStockSeverity } from './reconciliation';
 
-const prisma = new PrismaClient();
+export interface SaleOptions {
+  orderId?: string;
+  source?: 'POS' | 'MANUAL' | 'API';
+  /**
+   * A POS sale already happened physically. When the book shows fewer units
+   * than were sold, record the sale (flooring stock at 0) and raise a
+   * discrepancy alert instead of rejecting it.
+   */
+  allowOversell?: boolean;
+}
 
 export class InventoryService {
   /**
@@ -12,296 +25,238 @@ export class InventoryService {
   static async commitStock(sku: string, qty: number, shelfLabel: string): Promise<Product> {
     logger.info('Committing stock to shelf', { sku, qty, shelfLabel });
 
-    return await prisma.$transaction(async (tx) => {
-      // 1. Find or create the shelf
+    const { product, shelf } = await prisma.$transaction(async (tx) => {
+      const existing = await tx.product.findUnique({ where: { sku } });
+      if (!existing) throw new AppError(404, `Product with SKU ${sku} not found`);
+
+      // Restocking is not a visual scan, so lastScanned is left untouched.
       const shelf = await tx.shelf.upsert({
         where: { label: shelfLabel },
-        update: { lastScanned: new Date() },
-        create: { 
-          label: shelfLabel, 
-          lastScanned: new Date() 
-        }
+        update: {},
+        create: { label: shelfLabel },
       });
 
-      // 2. Update product and link to shelf
       const product = await tx.product.update({
         where: { sku },
-        data: { 
+        data: {
           stock: { increment: qty },
-          shelfId: shelf.id
-        }
+          shelfId: shelf.id,
+        },
       });
 
-      // 3. Check if we're now overstocked
-      if (product.stock > product.maxCapacity) {
-        await AlertService.createAlert({
-          productId: product.id,
-          shelfLabel: shelf.label,
-          type: AlertType.OVERSTOCKED,
-          severity: AlertSeverity.MEDIUM,
-          message: `Product ${product.name} exceeds max capacity. Current: ${product.stock}, Max: ${product.maxCapacity}`,
-        });
-      }
-
-      logger.info('Stock committed successfully', { 
-        sku, 
-        newStock: product.stock,
-        shelfId: shelf.id 
-      });
-
-      return product;
+      return { product, shelf };
     });
+
+    // Side effects run after commit so they never observe rolled-back state.
+    publish({ type: 'stock.changed', sku, stock: product.stock, reason: 'restock' });
+
+    if (product.stock > product.minThreshold) {
+      await AlertService.autoResolve(product.id, AlertType.LOW_STOCK, `Restocked to ${product.stock} units`);
+    }
+
+    if (product.stock > product.maxCapacity) {
+      await AlertService.createAlert({
+        productId: product.id,
+        shelfLabel: shelf.label,
+        type: AlertType.OVERSTOCKED,
+        severity: AlertSeverity.MEDIUM,
+        message: `${product.name} exceeds max capacity. Current: ${product.stock}, Max: ${product.maxCapacity}`,
+      });
+    }
+
+    return product;
   }
 
   /**
-   * Subtract stock when a sale occurs
-   * IMPLEMENTED: This was previously throwing "Method not implemented"
+   * Subtract stock when a sale occurs.
    */
-  static async subtractStock(sku: string, quantity: number, orderId?: string): Promise<Product> {
-    logger.info('Subtracting stock for sale', { sku, quantity, orderId });
+  static async subtractStock(sku: string, quantity: number, options: SaleOptions = {}): Promise<Product> {
+    const { orderId, allowOversell = false } = options;
+    const source = options.source ?? (orderId ? 'POS' : 'MANUAL');
+    logger.info('Subtracting stock for sale', { sku, quantity, orderId, source });
 
-    return await prisma.$transaction(async (tx) => {
-      // 1. Get current product state
-      const product = await tx.product.findUnique({ where: { sku } });
-      
-      if (!product) {
-        throw new Error(`Product with SKU ${sku} not found`);
-      }
-
-      if (product.stock < quantity) {
-        logger.warn('Attempted to sell more than available stock', {
-          sku,
-          requested: quantity,
-          available: product.stock
-        });
-        throw new Error(`Insufficient stock for ${sku}. Available: ${product.stock}, Requested: ${quantity}`);
-      }
-
-      const stockBefore = product.stock;
-
-      // 2. Decrement stock
-      const updatedProduct = await tx.product.update({
+    const { product, shelfLabel, oversold } = await prisma.$transaction(async (tx) => {
+      const current = await tx.product.findUnique({
         where: { sku },
-        data: { stock: { decrement: quantity } }
+        include: { shelf: { select: { label: true } } },
       });
+      if (!current) throw new AppError(404, `Product with SKU ${sku} not found`);
 
-      // 3. Log the sale event
+      const oversold = Math.max(0, quantity - current.stock);
+      if (oversold > 0 && !allowOversell) {
+        throw new AppError(409, `Insufficient stock for ${sku}. Available: ${current.stock}, Requested: ${quantity}`);
+      }
+
+      // Guard against a concurrent sale having changed stock since the read.
+      const decrement = quantity - oversold;
+      const { count } = await tx.product.updateMany({
+        where: { id: current.id, stock: { gte: decrement } },
+        data: { stock: { decrement } },
+      });
+      if (count === 0) throw new AppError(409, `Stock for ${sku} changed concurrently, please retry`);
+
+      const product = await tx.product.findUniqueOrThrow({ where: { id: current.id } });
+
       await tx.saleEvent.create({
         data: {
-          productId: product.id,
+          productId: current.id,
           quantity,
           orderId,
-          stockBefore,
-          stockAfter: updatedProduct.stock,
-          source: orderId ? 'POS' : 'MANUAL'
-        }
+          stockBefore: current.stock,
+          stockAfter: product.stock,
+          source,
+        },
       });
 
-      // 4. Check if we need to trigger alerts
-      if (updatedProduct.stock <= updatedProduct.minThreshold) {
-        await AlertService.createAlert({
-          productId: product.id,
-          shelfLabel: product.shelfId ? 'Unknown' : 'Unknown', // Will be resolved in alert service
-          type: AlertType.LOW_STOCK,
-          severity: updatedProduct.stock === 0 ? AlertSeverity.CRITICAL : AlertSeverity.HIGH,
-          message: `Low stock alert for ${product.name}. Current stock: ${updatedProduct.stock}`,
-        });
-      }
-
-      logger.info('Stock subtracted successfully', {
-        sku,
-        quantitySold: quantity,
-        remainingStock: updatedProduct.stock
-      });
-
-      return updatedProduct;
+      return { product, shelfLabel: current.shelf?.label ?? 'Unassigned', oversold };
     });
+
+    publish({ type: 'stock.changed', sku, stock: product.stock, reason: 'sale' });
+
+    if (oversold > 0) {
+      await AlertService.createAlert({
+        productId: product.id,
+        shelfLabel,
+        type: AlertType.DISCREPANCY,
+        severity: AlertSeverity.HIGH,
+        message: `POS sold ${quantity} × ${product.name} but only ${quantity - oversold} were on record. Book stock is understated by at least ${oversold}.`,
+      });
+    }
+
+    if (product.stock <= product.minThreshold) {
+      await AlertService.createAlert({
+        productId: product.id,
+        shelfLabel,
+        type: AlertType.LOW_STOCK,
+        severity: lowStockSeverity(product.stock),
+        message: `Low stock for ${product.name}: ${product.stock} left (minimum ${product.minThreshold}).`,
+      });
+    }
+
+    return product;
+  }
+
+  /**
+   * Put stock back, e.g. after a cancelled or refunded order.
+   */
+  static async restoreStock(sku: string, quantity: number, reason: string): Promise<Product> {
+    const product = await prisma.product.update({
+      where: { sku },
+      data: { stock: { increment: quantity } },
+    });
+
+    logger.info('Stock restored', { sku, quantity, reason, stock: product.stock });
+    publish({ type: 'stock.changed', sku, stock: product.stock, reason: 'return' });
+    return product;
+  }
+
+  /**
+   * Whether a POS order line was already applied (webhook retries are common).
+   */
+  static async hasProcessedOrderLine(orderId: string, sku: string): Promise<boolean> {
+    const existing = await prisma.saleEvent.findFirst({
+      where: { orderId, product: { sku } },
+      select: { id: true },
+    });
+    return existing !== null;
   }
 
   /**
    * The "Reconciliation Engine"
-   * Compares the digital book vs. the visual AI audit.
+   * Compares the digital book against a visual AI audit and raises alerts.
    */
-  static async reconcile(productId: string): Promise<void> {
-    logger.info('Starting reconciliation', { productId });
-
-    const product = await prisma.product.findUnique({ 
-      where: { id: productId },
-      include: { 
-        shelf: true,
-        auditLogs: { 
-          orderBy: { createdAt: 'desc' }, 
-          take: 1 
-        } 
-      }
+  static async reconcile(auditLog: AuditLog): Promise<AlertType | null> {
+    const product = await prisma.product.findUnique({
+      where: { id: auditLog.productId },
+      include: { shelf: { include: { alertConfig: true } } },
     });
+    if (!product) return null;
 
-    if (!product || product.auditLogs.length === 0) {
-      logger.warn('No audit logs found for reconciliation', { productId });
-      return;
-    }
+    const phantomThreshold =
+      product.shelf?.alertConfig?.phantomStockThreshold ?? DEFAULT_SHELF_CONFIG.phantomStockThreshold;
+    const outcome = classifyAudit(auditLog, phantomThreshold);
 
-    const latestAudit = product.auditLogs[0];
-    const discrepancy = Math.abs(latestAudit.discrepancy);
-    
-    // Get alert configuration for this shelf
-    const alertConfig = product.shelfId 
-      ? await prisma.shelfAlertConfig.findUnique({ 
-          where: { shelfId: product.shelfId } 
-        })
-      : null;
-
-    const phantomThreshold = alertConfig?.phantomStockThreshold ?? 5;
-
-    logger.info('Reconciliation data', {
-      productId,
-      systemCount: latestAudit.systemCount,
-      visualCount: latestAudit.visualCount,
-      discrepancy,
-      phantomThreshold
-    });
-
-    // CRITICAL: Phantom Stock Detection
-    // System thinks we have stock, but shelf is visually empty
-    if (latestAudit.visualCount === 0 && latestAudit.systemCount > phantomThreshold) {
-      await this.triggerPhantomStockAlert(product, latestAudit);
-    }
-    
-    // HIGH: Significant discrepancy requiring manual review
-    else if (discrepancy > 3 && latestAudit.confidence > 0.8) {
-      await AlertService.createAlert({
-        productId: product.id,
-        shelfLabel: product.shelf?.label ?? 'Unknown',
-        type: AlertType.DISCREPANCY,
-        severity: AlertSeverity.HIGH,
-        message: `Count discrepancy detected for ${product.name}. System: ${latestAudit.systemCount}, Visual: ${latestAudit.visualCount}`,
-      });
-    }
-    
-    // MEDIUM: Small discrepancy, possibly due to misplacement or scanning error
-    else if (discrepancy >= 1 && latestAudit.confidence > 0.7) {
-      await AlertService.createAlert({
-        productId: product.id,
-        shelfLabel: product.shelf?.label ?? 'Unknown',
-        type: AlertType.DISCREPANCY,
-        severity: AlertSeverity.MEDIUM,
-        message: `Minor count mismatch for ${product.name}. System: ${latestAudit.systemCount}, Visual: ${latestAudit.visualCount}`,
-      });
-    }
-
-    // Update audit log to mark alert as triggered
-    await prisma.auditLog.update({
-      where: { id: latestAudit.id },
-      data: { 
-        alertTriggered: true,
-        alertType: this.determineAlertType(latestAudit.systemCount, latestAudit.visualCount, phantomThreshold)
-      }
-    });
-
-    logger.info('Reconciliation completed', { productId });
-  }
-
-  /**
-   * Trigger urgent alert for phantom stock
-   */
-  private static async triggerPhantomStockAlert(product: any, auditLog: any): Promise<void> {
-    logger.error('PHANTOM STOCK DETECTED', {
-      productId: product.id,
-      productName: product.name,
+    logger.info('Reconciliation', {
+      sku: product.sku,
       systemCount: auditLog.systemCount,
       visualCount: auditLog.visualCount,
-      shelfLabel: product.shelf?.label
+      confidence: auditLog.confidence,
+      outcome: outcome?.type ?? 'OK',
     });
+
+    if (!outcome) return null;
+
+    const shelfLabel = product.shelf?.label ?? 'Unassigned';
+    const message =
+      outcome.type === AlertType.PHANTOM_STOCK
+        ? `Phantom stock: the book shows ${auditLog.systemCount} × ${product.name} but the shelf is empty.`
+        : `Count mismatch for ${product.name}. System: ${auditLog.systemCount}, Visual: ${auditLog.visualCount}.`;
 
     await AlertService.createAlert({
       productId: product.id,
-      shelfLabel: product.shelf?.label ?? 'Unknown',
-      type: AlertType.PHANTOM_STOCK,
-      severity: AlertSeverity.CRITICAL,
-      message: `CRITICAL: Phantom stock detected for ${product.name}. Database shows ${auditLog.systemCount} units, but shelf is EMPTY!`,
+      shelfLabel,
+      type: outcome.type,
+      severity: outcome.severity,
+      message,
     });
+
+    await prisma.auditLog.update({
+      where: { id: auditLog.id },
+      data: { alertTriggered: true, alertType: outcome.type },
+    });
+
+    return outcome.type;
   }
 
   /**
-   * Determine alert type based on counts
-   */
-  private static determineAlertType(systemCount: number, visualCount: number, threshold: number): AlertType | null {
-    if (visualCount === 0 && systemCount > threshold) {
-      return AlertType.PHANTOM_STOCK;
-    } else if (Math.abs(systemCount - visualCount) > 3) {
-      return AlertType.DISCREPANCY;
-    } else if (systemCount <= threshold) {
-      return AlertType.LOW_STOCK;
-    }
-    return null;
-  }
-
-  /**
-   * Get recent sales for a product to detect velocity patterns
+   * Units sold in the last `hoursBack` hours
    */
   static async getSalesVelocity(sku: string, hoursBack: number = 24): Promise<number> {
     const product = await prisma.product.findUnique({ where: { sku } });
-    if (!product) return 0;
+    if (!product) throw new AppError(404, `Product with SKU ${sku} not found`);
 
     const since = new Date(Date.now() - hoursBack * 60 * 60 * 1000);
-    
     const sales = await prisma.saleEvent.aggregate({
-      where: {
-        productId: product.id,
-        createdAt: { gte: since }
-      },
-      _sum: { quantity: true }
+      where: { productId: product.id, createdAt: { gte: since } },
+      _sum: { quantity: true },
     });
 
     return sales._sum.quantity ?? 0;
   }
 
   /**
-   * Check if a product needs vision audit based on sales activity
+   * Whether sales since the last shelf audit warrant a new vision check.
    */
   static async needsVisionCheck(sku: string): Promise<boolean> {
-    const product = await prisma.product.findUnique({ 
+    const product = await prisma.product.findUnique({
       where: { sku },
-      include: { 
-        shelf: { 
-          include: { 
+      include: {
+        shelf: {
+          include: {
             alertConfig: true,
-            auditLogs: { 
-              orderBy: { createdAt: 'desc' }, 
-              take: 1 
-            }
-          } 
+            auditLogs: { orderBy: { createdAt: 'desc' }, take: 1 },
+          },
         },
-        salesEvents: {
-          orderBy: { createdAt: 'desc' },
-          take: 1
-        }
-      }
+      },
     });
 
-    if (!product?.shelf?.alertConfig) return false;
+    if (!product?.shelf) return false;
 
-    const config = product.shelf.alertConfig;
+    const config = product.shelf.alertConfig ?? DEFAULT_SHELF_CONFIG;
     const lastAudit = product.shelf.auditLogs[0];
-    
-    // Check time-based trigger
+
     if (lastAudit) {
-      const minutesSinceLastAudit = (Date.now() - lastAudit.createdAt.getTime()) / 1000 / 60;
-      if (minutesSinceLastAudit < config.checkIntervalMinutes) {
-        return false; // Too soon
-      }
+      const minutesSinceLastAudit = (Date.now() - lastAudit.createdAt.getTime()) / 60_000;
+      if (minutesSinceLastAudit < config.checkIntervalMinutes) return false;
     }
 
-    // Check sales-based trigger
-    const recentSalesCount = await prisma.saleEvent.count({
+    const salesSinceAudit = await prisma.saleEvent.count({
       where: {
         productId: product.id,
-        createdAt: {
-          gte: lastAudit?.createdAt ?? new Date(0)
-        }
-      }
+        createdAt: { gte: lastAudit?.createdAt ?? new Date(0) },
+      },
     });
 
-    return recentSalesCount >= config.salesTriggerCount;
+    return salesSinceAudit >= config.salesTriggerCount;
   }
 }

@@ -10,84 +10,91 @@ datasource db {
 }
 
 model Product {
-  id           String      @id @default(cuid())
-  sku          String      @unique
+  id           String  @id @default(cuid())
+  sku          String  @unique
   name         String
-  stock        Int         @default(0)
-  minThreshold Int         @default(5)
-  maxCapacity  Int         @default(100)
-  price        Decimal     @default(0)
+  stock        Int     @default(0)
+  minThreshold Int     @default(5)
+  maxCapacity  Int     @default(100)
+  price        Decimal @default(0) @db.Decimal(10, 2)
   category     String?
   imageUrl     String?
-  
+
   // Shelf relationship
-  shelfId      String?
-  shelf        Shelf?      @relation(fields: [shelfId], references: [id])
-  
+  shelfId String?
+  shelf   Shelf?  @relation(fields: [shelfId], references: [id])
+
   // Audit trail
-  auditLogs    AuditLog[]
-  
+  auditLogs AuditLog[]
+
   // Sales tracking
-  salesEvents  SaleEvent[]
-  
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
-  
+  salesEvents SaleEvent[]
+
+  // Alerts raised for this product
+  alerts Alert[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   @@index([sku])
   @@index([shelfId])
   @@index([stock])
 }
 
 model Shelf {
-  id           String      @id @default(cuid())
-  label        String      @unique
-  zone         String?     // e.g., "Dairy", "Beverages"
-  cameraUrl    String?     // IP Camera endpoint
-  lastScanned  DateTime?
-  
+  id          String    @id @default(cuid())
+  label       String    @unique
+  zone        String? // e.g., "Dairy", "Beverages"
+  cameraUrl   String? // IP Camera endpoint
+  lastScanned DateTime?
+
+  // Position on the store floor plan (canvas coordinates)
+  posX Float?
+  posY Float?
+
   // Products on this shelf
-  products     Product[]
-  
+  products Product[]
+
   // Audit history for this shelf
-  auditLogs    AuditLog[]
-  
+  auditLogs AuditLog[]
+
   // Alert configuration
-  alertConfig  ShelfAlertConfig?
-  
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
-  
+  alertConfig ShelfAlertConfig?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   @@index([label])
 }
 
 model AuditLog {
-  id            String      @id @default(cuid())
-  
+  id String @id @default(cuid())
+
   // Product being audited
-  productId     String
-  product       Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
-  
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
   // Shelf context
-  shelfId       String
-  shelf         Shelf       @relation(fields: [shelfId], references: [id])
-  
+  shelfId String
+  shelf   Shelf  @relation(fields: [shelfId], references: [id], onDelete: Cascade)
+
   // Counts
-  systemCount   Int         // What the database thinks
-  visualCount   Int         // What AI sees
-  discrepancy   Int         // Difference
-  
+  systemCount Int // What the database thinks
+  visualCount Int // What AI sees
+  discrepancy Int // Difference
+
   // AI metadata
-  confidence    Float       @default(0)
-  status        AuditStatus @default(PENDING)
-  imageUrl      String?
-  rawAiOutput   String?     @db.Text
-  
+  confidence  Float       @default(0)
+  status      AuditStatus @default(PENDING)
+  imageUrl    String?
+  rawAiOutput String?     @db.Text
+
   // Alert tracking
   alertTriggered Boolean    @default(false)
   alertType      AlertType?
-  
-  createdAt     DateTime    @default(now())
-  
+
+  createdAt DateTime @default(now())
+
   @@index([productId, createdAt])
   @@index([shelfId, createdAt])
   @@index([status])
@@ -95,95 +102,107 @@ model AuditLog {
 }
 
 model SaleEvent {
-  id          String      @id @default(cuid())
-  
-  productId   String
-  product     Product     @relation(fields: [productId], references: [id])
-  
-  quantity    Int
-  orderId     String?     // External POS order reference
-  
+  id String @id @default(cuid())
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  quantity Int
+  orderId  String? // External POS order reference
+
   // Stock before/after for tracking
   stockBefore Int
   stockAfter  Int
-  
+
   // Webhook metadata
-  source      String      @default("POS") // POS, MANUAL, API
-  webhookId   String?
-  
-  createdAt   DateTime    @default(now())
-  
+  source    String  @default("POS") // POS, MANUAL, API
+  webhookId String?
+
+  createdAt DateTime @default(now())
+
   @@index([productId, createdAt])
   @@index([orderId])
+  @@index([createdAt])
 }
 
 model Alert {
-  id          String      @id @default(cuid())
-  
-  productId   String
-  shelfLabel  String
-  
-  type        AlertType
-  severity    AlertSeverity
-  message     String
-  
+  id String @id @default(cuid())
+
+  productId  String
+  product    Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  shelfLabel String
+
+  type     AlertType
+  severity AlertSeverity
+  message  String
+
   // Resolution tracking
-  status      AlertStatus @default(OPEN)
-  resolvedAt  DateTime?
-  resolvedBy  String?
-  resolution  String?     @db.Text
-  
+  status         AlertStatus @default(OPEN)
+  acknowledgedAt DateTime?
+  acknowledgedBy String?
+  resolvedAt     DateTime?
+  resolvedBy     String?
+  resolution     String?     @db.Text
+
   // Notification tracking
   notificationsSent String[] // ["slack", "sms", "email"]
-  
-  createdAt   DateTime    @default(now())
-  updatedAt   DateTime    @updatedAt
-  
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   @@index([status, severity])
   @@index([productId])
   @@index([createdAt])
 }
 
 model ShelfAlertConfig {
-  id                    String   @id @default(cuid())
-  
-  shelfId               String   @unique
-  shelf                 Shelf    @relation(fields: [shelfId], references: [id])
-  
+  id String @id @default(cuid())
+
+  shelfId String @unique
+  shelf   Shelf  @relation(fields: [shelfId], references: [id], onDelete: Cascade)
+
   // Thresholds
-  phantomStockThreshold Int      @default(5)  // Trigger if system > X and visual = 0
-  lowStockThreshold     Int      @default(3)  // Standard low stock warning
-  
+  phantomStockThreshold Int @default(5) // Trigger if system > X and visual = 0
+  lowStockThreshold     Int @default(3) // Standard low stock warning
+
   // Timing configuration
-  checkIntervalMinutes  Int      @default(30) // How often to auto-audit
-  salesTriggerCount     Int      @default(10) // Check after N sales
-  
+  checkIntervalMinutes Int @default(30) // How often to auto-audit
+  salesTriggerCount    Int @default(10) // Check after N sales
+
   // Notification settings
-  enableSlack           Boolean  @default(true)
-  enableSms             Boolean  @default(false)
-  enableEmail           Boolean  @default(true)
-  
-  createdAt             DateTime @default(now())
-  updatedAt             DateTime @updatedAt
+  enableSlack Boolean @default(true)
+  enableSms   Boolean @default(false)
+  enableEmail Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model WebhookLog {
-  id          String      @id @default(cuid())
-  
-  source      String      // "POS", "WMS", etc.
-  eventType   String
-  payload     String      @db.Text
-  signature   String?
-  
-  verified    Boolean     @default(false)
-  processed   Boolean     @default(false)
-  error       String?     @db.Text
-  
-  createdAt   DateTime    @default(now())
+  id String @id @default(cuid())
+
+  source    String // "POS", "WMS", etc.
+  eventType String
+  payload   String  @db.Text
+  signature String?
+
+  verified  Boolean @default(false)
+  processed Boolean @default(false)
+  error     String? @db.Text
+
+  createdAt   DateTime  @default(now())
   processedAt DateTime?
-  
+
   @@index([source, processed])
   @@index([createdAt])
+}
+
+// Store floor plan: walls and non-shelf points of interest (cameras,
+// entrances, checkouts). Shelf positions live on the Shelf model itself.
+model FloorPlan {
+  id        String   @id @default("default")
+  layout    Json
+  updatedAt DateTime @updatedAt
 }
 
 // Enums
@@ -195,12 +214,12 @@ enum AuditStatus {
 }
 
 enum AlertType {
-  PHANTOM_STOCK      // DB says full, shelf is empty
-  LOW_STOCK          // Below minimum threshold
-  OVERSTOCKED        // Exceeds max capacity
-  MISPLACED          // Item on wrong shelf
-  CAMERA_FAILURE     // Vision system error
-  DISCREPANCY        // Count mismatch requiring review
+  PHANTOM_STOCK // DB says full, shelf is empty
+  LOW_STOCK // Below minimum threshold
+  OVERSTOCKED // Exceeds max capacity
+  MISPLACED // Item on wrong shelf
+  CAMERA_FAILURE // Vision system error
+  DISCREPANCY // Count mismatch requiring review
 }
 
 enum AlertSeverity {

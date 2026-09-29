@@ -1,8 +1,10 @@
 // src/services/analyticsService.ts
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../lib/prisma';
 import { logger } from '../utils/logger';
+import { ProductService } from './productService';
+import { ShelfService } from './shelfService';
 
-const prisma = new PrismaClient();
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 export class AnalyticsService {
   /**
@@ -11,84 +13,62 @@ export class AnalyticsService {
   static async getDashboardOverview(days: number = 7) {
     logger.info('Generating dashboard overview', { days });
 
-    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const since = new Date(Date.now() - days * DAY_MS);
+
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
 
     const [
-      totalProducts,
+      summary,
       totalShelves,
+      shelvesDue,
       openAlerts,
+      criticalAlerts,
       recentAudits,
+      auditsToday,
       totalSales,
-      lowStockProducts,
       phantomStockIncidents,
       auditAccuracy
     ] = await Promise.all([
-      // Total products
-      prisma.product.count(),
-
-      // Total shelves
+      ProductService.getInventorySummary(),
       prisma.shelf.count(),
-
-      // Open alerts
-      prisma.alert.count({
-        where: {
-          status: { in: ['OPEN', 'ACKNOWLEDGED'] }
-        }
-      }),
-
-      // Recent audits
-      prisma.auditLog.count({
-        where: { createdAt: { gte: since } }
-      }),
-
-      // Total sales
-      prisma.saleEvent.aggregate({
-        where: { createdAt: { gte: since } },
-        _sum: { quantity: true }
-      }),
-
-      // Low stock products
-      prisma.product.count({
-        where: {
-          AND: [
-            { stock: { gt: 0 } },
-            { stock: { lte: prisma.product.fields.minThreshold } }
-          ]
-        }
-      }),
-
-      // Phantom stock incidents
-      prisma.alert.count({
-        where: {
-          type: 'PHANTOM_STOCK',
-          createdAt: { gte: since }
-        }
-      }),
-
-      // Audit accuracy (average confidence)
+      ShelfService.getShelvesDueForAudit(),
+      prisma.alert.count({ where: { status: { in: ['OPEN', 'ACKNOWLEDGED', 'IN_PROGRESS'] } } }),
+      prisma.alert.count({ where: { status: { in: ['OPEN', 'ACKNOWLEDGED', 'IN_PROGRESS'] }, severity: 'CRITICAL' } }),
+      prisma.auditLog.count({ where: { createdAt: { gte: since } } }),
+      prisma.auditLog.count({ where: { createdAt: { gte: startOfToday } } }),
+      prisma.saleEvent.aggregate({ where: { createdAt: { gte: since } }, _sum: { quantity: true } }),
+      prisma.alert.count({ where: { type: 'PHANTOM_STOCK', createdAt: { gte: since } } }),
+      // Mean model confidence over completed audits
       prisma.auditLog.aggregate({
-        where: { createdAt: { gte: since } },
+        where: { createdAt: { gte: since }, status: 'COMPLETED' },
         _avg: { confidence: true }
       })
     ]);
 
     return {
       inventory: {
-        totalProducts,
-        lowStockProducts,
-        stockValue: 0 // TODO: Calculate based on prices
+        totalProducts: summary.totalProducts,
+        totalStock: summary.totalStock,
+        inStockProducts: summary.inStockItems,
+        lowStockProducts: summary.lowStockItems,
+        outOfStockProducts: summary.outOfStockItems,
+        overstockedProducts: summary.overstockedItems,
+        stockValue: summary.stockValue
       },
       shelves: {
         total: totalShelves,
-        needingAudit: 0 // TODO: Calculate
+        needingAudit: shelvesDue.length
       },
       alerts: {
         open: openAlerts,
+        critical: criticalAlerts,
         phantomStockIncidents
       },
       audits: {
         recent: recentAudits,
-        averageAccuracy: auditAccuracy._avg.confidence || 0
+        today: auditsToday,
+        averageConfidence: auditAccuracy._avg.confidence ?? null
       },
       sales: {
         totalQuantity: totalSales._sum.quantity || 0,
@@ -103,7 +83,7 @@ export class AnalyticsService {
   static async getAlertTrends(days: number = 30) {
     logger.info('Calculating alert trends', { days });
 
-    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const since = new Date(Date.now() - days * DAY_MS);
 
     const alerts = await prisma.alert.findMany({
       where: { createdAt: { gte: since } },
@@ -114,25 +94,27 @@ export class AnalyticsService {
       }
     });
 
-    // Group by day
+    // One bucket per day (UTC), including days without alerts, so charts
+    // get a continuous axis.
     const trendsByDay: { [key: string]: any } = {};
+    for (let i = days - 1; i >= 0; i--) {
+      const dateKey = new Date(Date.now() - i * DAY_MS).toISOString().split('T')[0];
+      trendsByDay[dateKey] = {
+        date: dateKey,
+        total: 0,
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+        phantomStock: 0,
+        lowStock: 0,
+        discrepancy: 0
+      };
+    }
 
     alerts.forEach(alert => {
       const dateKey = alert.createdAt.toISOString().split('T')[0];
-      
-      if (!trendsByDay[dateKey]) {
-        trendsByDay[dateKey] = {
-          date: dateKey,
-          total: 0,
-          critical: 0,
-          high: 0,
-          medium: 0,
-          low: 0,
-          phantomStock: 0,
-          lowStock: 0,
-          discrepancy: 0
-        };
-      }
+      if (!trendsByDay[dateKey]) return;
 
       trendsByDay[dateKey].total++;
       trendsByDay[dateKey][alert.severity.toLowerCase()]++;
@@ -153,7 +135,7 @@ export class AnalyticsService {
   static async getStockMovementAnalysis(days: number = 30) {
     logger.info('Analyzing stock movement', { days });
 
-    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const since = new Date(Date.now() - days * DAY_MS);
 
     const sales = await prisma.saleEvent.findMany({
       where: { createdAt: { gte: since } },
@@ -213,7 +195,7 @@ export class AnalyticsService {
   static async getAuditPerformance(days: number = 30) {
     logger.info('Calculating audit performance', { days });
 
-    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const since = new Date(Date.now() - days * DAY_MS);
 
     const [auditStats, shelfPerformance] = await Promise.all([
       prisma.auditLog.aggregate({
@@ -235,11 +217,6 @@ export class AnalyticsService {
               alertTriggered: true
             }
           },
-          _count: {
-            select: {
-              auditLogs: true
-            }
-          }
         }
       })
     ]);
@@ -270,7 +247,7 @@ export class AnalyticsService {
       overall: {
         totalAudits: auditStats._count,
         avgConfidence: auditStats._avg.confidence || 0,
-        avgDiscrepancy: Math.abs(auditStats._avg.discrepancy || 0)
+        avgDiscrepancy: Number(Math.abs(auditStats._avg.discrepancy || 0).toFixed(2))
       },
       byShelf: shelfStats.sort((a, b) => b.auditCount - a.auditCount)
     };
@@ -282,7 +259,7 @@ export class AnalyticsService {
   static async getPhantomStockHotspots(days: number = 30) {
     logger.info('Identifying phantom stock hotspots', { days });
 
-    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const since = new Date(Date.now() - days * DAY_MS);
 
     const phantomAlerts = await prisma.alert.findMany({
       where: {
@@ -410,7 +387,7 @@ export class AnalyticsService {
         status: openAlerts > 10 ? 'attention' : 'normal'
       },
       errors: {
-        lastHour: recentErrors,
+        webhookFailuresLastHour: recentErrors,
         status: recentErrors > 5 ? 'unhealthy' : 'healthy'
       },
       overall: recentErrors > 5 || openAlerts > 10 ? 'needs-attention' : 'healthy'
@@ -431,12 +408,12 @@ export class AnalyticsService {
       phantomHotspots,
       systemHealth
     ] = await Promise.all([
-      this.getDashboardOverview(days),
-      this.getAlertTrends(days),
-      this.getStockMovementAnalysis(days),
-      this.getAuditPerformance(days),
-      this.getPhantomStockHotspots(days),
-      this.getSystemHealth()
+      AnalyticsService.getDashboardOverview(days),
+      AnalyticsService.getAlertTrends(days),
+      AnalyticsService.getStockMovementAnalysis(days),
+      AnalyticsService.getAuditPerformance(days),
+      AnalyticsService.getPhantomStockHotspots(days),
+      AnalyticsService.getSystemHealth()
     ]);
 
     return {

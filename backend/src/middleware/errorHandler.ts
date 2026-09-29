@@ -1,5 +1,5 @@
 // src/middleware/errorHandler.ts
-import { Request, Response, NextFunction } from 'express';
+import { Request, Response, NextFunction, RequestHandler } from 'express';
 import { Prisma } from '@prisma/client';
 import { logger } from '../utils/logger';
 
@@ -21,12 +21,14 @@ export const errorHandler = (
   err: Error,
   req: Request,
   res: Response,
-  next: NextFunction
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _next: NextFunction
 ) => {
-  // Log error
-  logger.error('Error occurred:', {
+  const isOperational = err instanceof AppError && err.statusCode < 500;
+  const log = isOperational ? logger.warn.bind(logger) : logger.error.bind(logger);
+  log('Request failed', {
     error: err.message,
-    stack: err.stack,
+    stack: isOperational ? undefined : err.stack,
     path: req.path,
     method: req.method,
     correlationId: req.headers['x-correlation-id'],
@@ -37,6 +39,10 @@ export const errorHandler = (
     return handlePrismaError(err, res);
   }
 
+  if (err instanceof Prisma.PrismaClientValidationError) {
+    return res.status(400).json({ error: 'Invalid request for database operation' });
+  }
+
   // Handle custom AppError
   if (err instanceof AppError) {
     return res.status(err.statusCode).json({
@@ -45,12 +51,17 @@ export const errorHandler = (
     });
   }
 
-  // Handle multer errors (file upload)
-  if (err.name === 'MulterError') {
+  // Handle multer errors (file upload) and the upload file filter
+  if (err.name === 'MulterError' || err.message === 'Only image files are allowed') {
     return res.status(400).json({
       error: 'File upload error',
       details: err.message,
     });
+  }
+
+  // Malformed JSON body
+  if (err instanceof SyntaxError && 'body' in err) {
+    return res.status(400).json({ error: 'Malformed JSON body' });
   }
 
   // Default to 500 server error
@@ -71,20 +82,20 @@ const handlePrismaError = (err: Prisma.PrismaClientKnownRequestError, res: Respo
         error: 'Resource already exists',
         field: (err.meta?.target as string[])?.join(', '),
       });
-    
+
     case 'P2025':
       // Record not found
       return res.status(404).json({
         error: 'Resource not found',
       });
-    
+
     case 'P2003':
       // Foreign key constraint failed
       return res.status(400).json({
         error: 'Invalid reference',
         details: 'The referenced resource does not exist',
       });
-    
+
     default:
       return res.status(500).json({
         error: 'Database error',
@@ -106,8 +117,10 @@ export const notFoundHandler = (req: Request, res: Response) => {
 /**
  * Async handler wrapper to catch promise rejections
  */
-export const asyncHandler = (fn: Function) => {
-  return (req: Request, res: Response, next: NextFunction) => {
+export const asyncHandler = (
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>
+): RequestHandler => {
+  return (req, res, next) => {
     Promise.resolve(fn(req, res, next)).catch(next);
   };
 };

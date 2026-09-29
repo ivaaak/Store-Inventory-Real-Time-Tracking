@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 import { ProductService } from '../services/productService';
 import { asyncHandler } from '../middleware/errorHandler';
 import { logger } from '../utils/logger';
+import { CreateProductInput, UpdateProductInput } from '../validation/schemas';
 
 export class ProductController {
   /**
@@ -10,19 +11,7 @@ export class ProductController {
    * Create a new product
    */
   static createProduct = asyncHandler(async (req: Request, res: Response) => {
-    const { sku, name, minThreshold, maxCapacity, price, category, imageUrl } = req.body;
-
-    logger.info('Creating new product', { sku, name });
-
-    const product = await ProductService.createProduct({
-      sku,
-      name,
-      minThreshold,
-      maxCapacity,
-      price,
-      category,
-      imageUrl
-    });
+    const product = await ProductService.createProduct(req.body as CreateProductInput);
 
     return res.status(201).json({
       message: 'Product created successfully',
@@ -36,11 +25,7 @@ export class ProductController {
    */
   static updateProduct = asyncHandler(async (req: Request, res: Response) => {
     const { sku } = req.params;
-    const updates = req.body;
-
-    logger.info('Updating product', { sku });
-
-    const product = await ProductService.updateProduct(sku, updates);
+    const product = await ProductService.updateProduct(sku, req.body as UpdateProductInput);
 
     return res.status(200).json({
       message: 'Product updated successfully',
@@ -92,26 +77,22 @@ export class ProductController {
    * List products with filtering
    */
   static listProducts = asyncHandler(async (req: Request, res: Response) => {
-    const { category, shelfLabel, lowStock, limit, offset } = req.query;
-
-    logger.info('Listing products', { category, shelfLabel, lowStock });
+    const { q, category, shelfLabel, lowStock } = req.query;
+    const limit = Math.min(Number(req.query.limit) || 50, 500);
+    const offset = Number(req.query.offset) || 0;
 
     const { products, total } = await ProductService.listProducts({
+      q: q as string | undefined,
       category: category as string,
       shelfLabel: shelfLabel as string,
       lowStock: lowStock === 'true',
-      limit: limit ? Number(limit) : undefined,
-      offset: offset ? Number(offset) : undefined
+      limit,
+      offset
     });
 
     return res.status(200).json({
       data: products,
-      pagination: {
-        total,
-        limit: Number(limit) || 50,
-        offset: Number(offset) || 0,
-        hasMore: total > (Number(offset) || 0) + (Number(limit) || 50)
-      }
+      pagination: { total, limit, offset, hasMore: total > offset + limit }
     });
   });
 
@@ -151,12 +132,6 @@ export class ProductController {
   static bulkUpdateStock = asyncHandler(async (req: Request, res: Response) => {
     const { updates } = req.body;
 
-    if (!Array.isArray(updates)) {
-      return res.status(400).json({
-        error: 'Updates must be an array'
-      });
-    }
-
     logger.info('Performing bulk stock update', { count: updates.length });
 
     const result = await ProductService.bulkUpdateStock(updates);
@@ -174,12 +149,6 @@ export class ProductController {
   static assignToShelf = asyncHandler(async (req: Request, res: Response) => {
     const { sku } = req.params;
     const { shelfLabel } = req.body;
-
-    if (!shelfLabel) {
-      return res.status(400).json({
-        error: 'shelfLabel is required'
-      });
-    }
 
     logger.info('Assigning product to shelf', { sku, shelfLabel });
 

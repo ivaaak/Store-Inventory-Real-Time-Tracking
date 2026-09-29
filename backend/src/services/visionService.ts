@@ -3,278 +3,194 @@ import fs from 'fs';
 import OpenAI from 'openai';
 import { AIAnalysisResult, VisualItemAnalysis } from '../types';
 import { logger } from '../utils/logger';
+import { AppError } from '../middleware/errorHandler';
 
-// Initialize OpenAI with your API Key
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+export type VisionProvider = 'openai' | 'mock';
+
+/** Raised when the vision provider cannot produce a usable result. */
+export class VisionError extends Error {
+  constructor(message: string, public rawOutput?: string) {
+    super(message);
+    this.name = 'VisionError';
+  }
+}
+
+export interface ExpectedProduct {
+  name: string;
+  /** Units the book says are on the shelf; only used by the mock provider. */
+  systemCount: number;
+}
+
+let openaiClient: OpenAI | null = null;
 
 /**
- * Encodes a local file to base64 for API transmission
+ * Which provider to use. `VISION_PROVIDER=mock` gives deterministic fake
+ * counts for local development without an OpenAI key.
  */
-const encodeImage = (imagePath: string): string => {
-  const imageBuffer = fs.readFileSync(imagePath);
-  return imageBuffer.toString('base64');
-};
+export function getVisionProvider(): VisionProvider | null {
+  const configured = process.env.VISION_PROVIDER?.toLowerCase();
+  if (configured === 'mock') return 'mock';
+  if (process.env.OPENAI_API_KEY) return 'openai';
+  return null;
+}
+
+function getOpenAI(): OpenAI {
+  // Constructed lazily: the SDK throws when the key is missing, which would
+  // otherwise crash the whole server at import time.
+  if (!openaiClient) openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return openaiClient;
+}
+
+const normalize = (s: string) => s.trim().toLowerCase().replace(/\s+/g, ' ');
 
 /**
- * Analyze shelf image using OpenAI Vision API
- * Returns structured data about detected items and their counts
+ * Analyze a shelf image and count each expected product.
+ * Throws VisionError when the provider fails; callers must not treat a
+ * failure as "shelf empty".
  */
 export async function analyzeShelfImage(
   imagePath: string,
-  expectedProducts: string[]
-): Promise<AIAnalysisResult> {
-  
-  logger.info('Starting vision analysis', { 
-    imagePath, 
-    productCount: expectedProducts.length 
-  });
-
-  // Validate image file exists
-  if (!fs.existsSync(imagePath)) {
-    logger.error('Image file not found', { imagePath });
-    throw new Error(`Image file not found: ${imagePath}`);
+  mimeType: string,
+  expected: ExpectedProduct[]
+): Promise<AIAnalysisResult & { provider: VisionProvider }> {
+  const provider = getVisionProvider();
+  if (!provider) {
+    throw new AppError(503, 'Vision AI is not configured. Set OPENAI_API_KEY, or VISION_PROVIDER=mock for local development.');
   }
 
-  const base64Image = encodeImage(imagePath);
+  if (!fs.existsSync(imagePath)) {
+    throw new VisionError(`Image file not found: ${imagePath}`);
+  }
 
-  try {
-    // Construct a detailed prompt for the AI
-    const systemPrompt = `You are a retail inventory assistant specialized in analyzing shelf images.
-Your task is to count products on store shelves and assess their stock status.
+  logger.info('Starting vision analysis', { provider, productCount: expected.length });
 
-You must analyze the image and return a JSON object with this exact structure:
+  const result = provider === 'mock' ? mockAnalysis(expected) : await openAIAnalysis(imagePath, mimeType, expected);
+
+  return { ...result, provider };
+}
+
+async function openAIAnalysis(
+  imagePath: string,
+  mimeType: string,
+  expected: ExpectedProduct[]
+): Promise<AIAnalysisResult> {
+  const names = expected.map((p) => p.name);
+  const model = process.env.OPENAI_VISION_MODEL || 'gpt-4o';
+  const base64Image = fs.readFileSync(imagePath).toString('base64');
+
+  const systemPrompt = `You are a retail inventory assistant specialized in analyzing shelf images.
+Count products on store shelves and assess their stock status.
+
+Return a JSON object with this exact structure:
 {
   "items": [
-    {
-      "name": "Product Name",
-      "count": 0,
-      "status": "EMPTY" | "LOW" | "FULL",
-      "confidence": 0.0-1.0
-    }
+    { "name": "Product Name", "count": 0, "status": "EMPTY" | "LOW" | "FULL", "confidence": 0.0 }
   ]
 }
 
 Rules:
-1. Only analyze these specific products: ${expectedProducts.join(', ')}
-2. "count" must be an integer (0 or positive)
-3. "status" must be one of: EMPTY, LOW, FULL
-   - EMPTY: 0 items visible
-   - LOW: 1-3 items visible
-   - FULL: 4+ items visible
-4. "confidence" should reflect how certain you are (0.0 to 1.0)
-5. If a product is not visible, set count to 0 and status to EMPTY
-6. Be conservative with counts - if unsure, estimate lower
-7. Consider partially visible products as full items if >50% visible`;
+1. Only report these products, using exactly these names: ${names.join(', ')}
+2. "count" is a non-negative integer
+3. "status": EMPTY = 0 visible, LOW = 1-3 visible, FULL = 4+ visible
+4. "confidence" (0.0-1.0) reflects how certain you are of the count
+5. If a product is not visible, count 0 / EMPTY, with confidence reflecting how sure you are it is absent
+6. Be conservative with counts - if unsure, estimate lower and lower your confidence
+7. Count partially visible products if more than 50% visible`;
 
-    const userPrompt = `Analyze this store shelf image and count each of these products:
-${expectedProducts.map((p, i) => `${i + 1}. ${p}`).join('\n')}
+  const userPrompt = `Count each of these products on the shelf:
+${names.map((p, i) => `${i + 1}. ${p}`).join('\n')}
 
-For each product, determine:
-- Exact count of items visible
-- Stock status (EMPTY/LOW/FULL)
-- Your confidence level in this assessment
+Return only valid JSON.`;
 
-Return only valid JSON, no additional text.`;
-
-    logger.info('Calling OpenAI Vision API', { 
-      model: 'gpt-4o',
-      expectedProducts 
-    });
-
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o",
+  let content: string | null | undefined;
+  try {
+    const response = await getOpenAI().chat.completions.create({
+      model,
       messages: [
+        { role: 'system', content: systemPrompt },
         {
-          role: "system",
-          content: systemPrompt
-        },
-        {
-          role: "user",
+          role: 'user',
           content: [
-            { 
-              type: "text", 
-              text: userPrompt 
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:image/jpeg;base64,${base64Image}`,
-                detail: "high" // Use high detail for better accuracy
-              },
-            },
+            { type: 'text', text: userPrompt },
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Image}`, detail: 'high' } },
           ],
         },
       ],
-      response_format: { type: "json_object" },
+      response_format: { type: 'json_object' },
       max_tokens: 1000,
-      temperature: 0.3, // Lower temperature for more consistent results
+      temperature: 0.2,
     });
-
-    const content = response.choices[0].message.content;
-    if (!content) {
-      throw new Error("AI returned an empty response");
-    }
-
-    logger.info('OpenAI response received', { 
-      contentLength: content.length 
-    });
-
-    // Parse the AI's JSON output
-    const parsedData = JSON.parse(content);
-    
-    // Validate the response structure
-    if (!parsedData.items || !Array.isArray(parsedData.items)) {
-      logger.error('Invalid AI response structure', { parsedData });
-      throw new Error('AI response missing "items" array');
-    }
-
-    // Validate and sanitize each item
-    const detectedItems: VisualItemAnalysis[] = parsedData.items.map((item: any) => {
-      // Ensure all required fields are present
-      if (!item.name || typeof item.count !== 'number' || !item.status) {
-        logger.warn('Invalid item in AI response', { item });
-        return null;
-      }
-
-      // Validate status enum
-      const validStatuses = ['EMPTY', 'LOW', 'FULL', 'MISPLACED'];
-      if (!validStatuses.includes(item.status)) {
-        item.status = 'EMPTY'; // Default to EMPTY if invalid
-      }
-
-      // Ensure count is non-negative integer
-      item.count = Math.max(0, Math.floor(item.count));
-
-      // Ensure confidence is between 0 and 1
-      item.confidence = Math.max(0, Math.min(1, item.confidence || 0.5));
-
-      return {
-        name: item.name,
-        count: item.count,
-        status: item.status,
-        confidence: item.confidence
-      };
-    }).filter((item: any) => item !== null);
-
-    // Ensure all expected products are in the response
-    const missingProducts = expectedProducts.filter(
-      expected => !detectedItems.some(detected => detected.name === expected)
-    );
-
-    // Add missing products with zero count
-    for (const missing of missingProducts) {
-      logger.warn('Product not detected by AI, adding with zero count', { 
-        product: missing 
-      });
-      
-      detectedItems.push({
-        name: missing,
-        count: 0,
-        status: 'EMPTY',
-        confidence: 0.5 // Low confidence for missing items
-      });
-    }
-
-    logger.info('Vision analysis completed', {
-      detectedCount: detectedItems.length,
-      averageConfidence: (
-        detectedItems.reduce((sum, item) => sum + item.confidence, 0) / 
-        detectedItems.length
-      ).toFixed(2)
-    });
-
-    return {
-      timestamp: new Date(),
-      detectedItems,
-      rawOutput: content
-    };
-
+    content = response.choices[0]?.message.content;
   } catch (error: any) {
-    logger.error("Vision AI Error", { 
-      error: error.message,
-      stack: error.stack,
-      imagePath 
-    });
-
-    // Return a fallback "Empty" result if the AI fails
-    // This prevents system crashes while still logging the issue
-    return {
-      timestamp: new Date(),
-      detectedItems: expectedProducts.map(p => ({
-        name: p,
-        count: 0,
-        status: 'EMPTY',
-        confidence: 0
-      })),
-      rawOutput: `Error: ${error.message}`
-    };
-    
-  } finally {
-    // Cleanup: Remove the image from local storage after processing
-    try {
-      if (fs.existsSync(imagePath)) {
-        fs.unlinkSync(imagePath);
-        logger.info('Cleaned up uploaded image', { imagePath });
-      }
-    } catch (cleanupError: any) {
-      logger.error('Failed to cleanup image file', { 
-        imagePath, 
-        error: cleanupError.message 
-      });
-    }
+    throw new VisionError(`Vision provider request failed: ${error.message}`);
   }
-}
 
-/**
- * Trigger camera snapshot (future implementation)
- * This would integrate with IP cameras to capture images on-demand
- */
-export async function triggerCameraSnapshot(cameraUrl: string): Promise<string> {
-  logger.info('Triggering camera snapshot', { cameraUrl });
-  
-  // TODO: Implement actual camera integration
-  // This could use ONVIF protocol, RTSP, or vendor-specific APIs
-  
-  // For now, return a placeholder
-  throw new Error('Camera integration not yet implemented');
-  
-  /*
-  // Example implementation:
-  const response = await axios.get(`${cameraUrl}/snapshot`, {
-    responseType: 'arraybuffer',
-    timeout: 10000
-  });
-  
-  const imagePath = `uploads/camera-${Date.now()}.jpg`;
-  fs.writeFileSync(imagePath, response.data);
-  
-  return imagePath;
-  */
-}
+  if (!content) throw new VisionError('Vision provider returned an empty response');
 
-/**
- * Validate image quality before processing
- */
-export function validateImage(imagePath: string): { valid: boolean; reason?: string } {
+  let parsed: any;
   try {
-    const stats = fs.statSync(imagePath);
-    
-    // Check file size (min 10KB, max 10MB)
-    if (stats.size < 10 * 1024) {
-      return { valid: false, reason: 'Image file too small (min 10KB)' };
-    }
-    
-    if (stats.size > 10 * 1024 * 1024) {
-      return { valid: false, reason: 'Image file too large (max 10MB)' };
-    }
-    
-    // Check file exists and is readable
-    fs.accessSync(imagePath, fs.constants.R_OK);
-    
-    return { valid: true };
-  } catch (error: any) {
-    return { valid: false, reason: error.message };
+    parsed = JSON.parse(content);
+  } catch {
+    throw new VisionError('Vision provider returned invalid JSON', content);
   }
+  if (!Array.isArray(parsed?.items)) {
+    throw new VisionError('Vision response is missing the "items" array', content);
+  }
+
+  const byName = new Map(names.map((n) => [normalize(n), n]));
+  const detectedItems: VisualItemAnalysis[] = [];
+
+  for (const item of parsed.items) {
+    const canonical = typeof item?.name === 'string' ? byName.get(normalize(item.name)) : undefined;
+    if (!canonical || typeof item.count !== 'number') {
+      logger.warn('Ignoring unrecognised item in vision response', { item });
+      continue;
+    }
+    const count = Math.max(0, Math.floor(item.count));
+    detectedItems.push({
+      name: canonical,
+      count,
+      status: ['EMPTY', 'LOW', 'FULL', 'MISPLACED'].includes(item.status) ? item.status : statusFor(count),
+      confidence: clamp01(typeof item.confidence === 'number' ? item.confidence : 0.5),
+    });
+  }
+
+  // Products the model skipped are reported with zero confidence so the
+  // reconciliation engine treats them as inconclusive rather than empty.
+  for (const name of names) {
+    if (!detectedItems.some((d) => d.name === name)) {
+      logger.warn('Product missing from vision response', { product: name });
+      detectedItems.push({ name, count: 0, status: 'EMPTY', confidence: 0 });
+    }
+  }
+
+  return { timestamp: new Date(), detectedItems, rawOutput: content };
 }
+
+/**
+ * Deterministic fake: usually matches the book, sometimes shows a shortfall
+ * or an empty shelf so every alert path can be exercised locally.
+ */
+function mockAnalysis(expected: ExpectedProduct[]): AIAnalysisResult {
+  const detectedItems = expected.map<VisualItemAnalysis>(({ name, systemCount }) => {
+    const roll = Math.random();
+    let count = systemCount;
+    if (roll < 0.15) count = 0;
+    else if (roll < 0.4) count = Math.max(0, systemCount - 1 - Math.floor(Math.random() * 5));
+    return {
+      name,
+      count,
+      status: statusFor(count),
+      confidence: Number((0.82 + Math.random() * 0.16).toFixed(2)),
+    };
+  });
+
+  return {
+    timestamp: new Date(),
+    detectedItems,
+    rawOutput: JSON.stringify({ provider: 'mock', items: detectedItems }, null, 2),
+  };
+}
+
+const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
+const statusFor = (count: number): VisualItemAnalysis['status'] => (count === 0 ? 'EMPTY' : count <= 3 ? 'LOW' : 'FULL');

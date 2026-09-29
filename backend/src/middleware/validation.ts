@@ -1,76 +1,42 @@
 // src/middleware/validation.ts
 import { Request, Response, NextFunction } from 'express';
-import { AnyZodObject, ZodError } from 'zod';
+import { ZodError, ZodTypeAny } from 'zod';
+
+const validationError = (res: Response, error: ZodError) =>
+  res.status(400).json({
+    error: 'Validation failed',
+    details: error.errors.map((err) => ({
+      path: err.path.join('.'),
+      message: err.message,
+    })),
+  });
 
 /**
- * Middleware factory for validating requests with Zod schemas
+ * Validate and replace req.body with the parsed (coerced, defaulted) value.
+ * Works for JSON and multipart bodies alike — multipart fields arrive as
+ * strings, so schemas should coerce where needed.
  */
-export const validateRequest = (schema: AnyZodObject) => {
+export const validateBody = (schema: ZodTypeAny) => {
   return async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      await schema.parseAsync({
-        body: req.body,
-        query: req.query,
-        params: req.params,
-      });
-      next();
-    } catch (error) {
-      if (error instanceof ZodError) {
-        return res.status(400).json({
-          error: "Validation failed",
-          details: error.errors.map(err => ({
-            path: err.path.join('.'),
-            message: err.message,
-          })),
-        });
-      }
-      next(error);
-    }
+    const result = await schema.safeParseAsync(req.body ?? {});
+    if (!result.success) return validationError(res, result.error);
+    req.body = result.data;
+    next();
   };
 };
 
 /**
- * Validate just the body
+ * Validate the query string. The parsed value is stored on res.locals.query
+ * because req.query is a getter in Express 5 and should be treated as read-only.
  */
-export const validateBody = (schema: AnyZodObject) => {
+export const validateQuery = (schema: ZodTypeAny) => {
   return async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      req.body = await schema.parseAsync(req.body);
-      next();
-    } catch (error) {
-      if (error instanceof ZodError) {
-        return res.status(400).json({
-          error: "Validation failed",
-          details: error.errors.map(err => ({
-            path: err.path.join('.'),
-            message: err.message,
-          })),
-        });
-      }
-      next(error);
-    }
+    const result = await schema.safeParseAsync(req.query);
+    if (!result.success) return validationError(res, result.error);
+    res.locals.query = result.data;
+    next();
   };
 };
 
-/**
- * Validate multipart form data
- */
-export const validateMultipart = (schema: AnyZodObject) => {
-  return async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      await schema.parseAsync(req.body);
-      next();
-    } catch (error) {
-      if (error instanceof ZodError) {
-        return res.status(400).json({
-          error: "Validation failed",
-          details: error.errors.map(err => ({
-            path: err.path.join('.'),
-            message: err.message,
-          })),
-        });
-      }
-      next(error);
-    }
-  };
-};
+/** @deprecated multipart bodies are validated with validateBody */
+export const validateMultipart = validateBody;
