@@ -1,451 +1,158 @@
-# Shelf Monitoring & Real-Time Alerting System v2.0
+# Shelf Monitoring & Real-Time Alerting
 
-> High-accuracy solution for tracking supermarket shelf stock by reconciling **Perpetual Inventory** (POS data) with **Computer Vision** (Visual AI).
+Tracks supermarket shelf stock by reconciling **perpetual inventory** (what the book says, driven by POS sales and restocking scans) with **computer vision** (what a camera actually sees). Its main job is catching **phantom stock**: the system thinks an item is available, but the shelf is empty.
 
-## 🎯 Overview
+```
+POS webhook ──► ┐                          ┌──► Alerts (Slack / SMS / email)
+Restock scans ─►├─► Inventory service ◄──► │
+Shelf photos ──►┘   + reconciliation       └──► Live dashboard (SSE)
+                     engine (Postgres)
+```
 
-This system detects **"Phantom Stock"** — situations where the database thinks an item is available, but the physical shelf is actually empty. It combines three data sources:
-
-1. **Sales Data (The "Out"):** Real-time POS webhooks
-2. **Stocking App (The "In"):** Staff scanning items onto shelves
-3. **Vision AI (The "Eye"):** Periodic camera snapshots for verification
-
----
-
-## 🏗️ Architecture
-
-### Core Components
-
-- **Inventory Service:** Source of truth for stock management
-- **Reconciliation Engine:** Compares system count vs. visual count
-- **Alert System:** Multi-channel notifications (Slack, SMS, Email)
-- **Webhook Handler:** Secure POS integration with signature verification
-- **Vision Controller:** AI-powered shelf auditing
-
-### Technology Stack
-
-- **Runtime:** Node.js 20+ / TypeScript
-- **Database:** PostgreSQL with Prisma ORM
-- **AI Vision:** OpenAI GPT-4 Vision
-- **Notifications:** Slack, Twilio (SMS), SendGrid (Email)
-- **Infrastructure:** Docker & Docker Compose
+| Part | Stack |
+|---|---|
+| `backend/` | Node 20, Express, TypeScript, Prisma 5, PostgreSQL, OpenAI vision |
+| `frontend/` | React 18, Vite, TypeScript, CSS modules (no UI library) |
 
 ---
 
-## 🚀 Quick Start
+## Quick start (local development)
 
-### Prerequisites
+**Prerequisites:** Node 20+, and PostgreSQL 14+ (or Docker for the bundled one).
 
-- Docker & Docker Compose
-- Node.js 20+ (for local development)
-- OpenAI API key
-
-### Installation
-
-1. **Clone and install:**
 ```bash
-git clone <repository-url>
-cd shelf-monitoring-system
+# 1. Database
+cd backend
+docker compose up -d postgres
+
+# 2. API
+cp .env.example .env            # defaults point at the compose database
 npm install
+npm run db:setup                # apply migrations + seed demo data
+npm run dev                     # http://localhost:3000
+
+# 3. Dashboard (second terminal)
+cd frontend
+npm install
+npm run dev                     # http://localhost:3001 (proxies /api and /uploads)
 ```
 
-2. **Configure environment:**
-```bash
-cp .env.example .env
-# Edit .env with your API keys and configuration
-```
+**No OpenAI key?** Set `VISION_PROVIDER=mock` in `backend/.env`. Audits then return plausible fake counts, so you can exercise every alert path. The dashboard labels the provider as "Mock".
 
-3. **Start with Docker:**
-```bash
-docker-compose up --build -d
-```
+The seed is idempotent: shelves and products are upserted, and demo history (two weeks of sales, audits and alerts) is created only once.
 
-4. **Run migrations:**
-```bash
-docker-compose exec app npx prisma migrate deploy
-```
-
-5. **Seed database (optional):**
-```bash
-docker-compose exec app npm run prisma:seed
-```
-
-### Verify Installation
+### Full stack in Docker
 
 ```bash
-# Check health
-curl http://localhost:3000/health
-
-# View logs
-docker-compose logs -f app
+cd backend
+docker compose up --build -d    # API + Postgres; migrations run on start
+docker compose exec app npx prisma db seed   # optional demo data
 ```
 
 ---
 
-## 📡 API Endpoints
+## The dashboard
 
-### Inventory Management
+| Page | What it does |
+|---|---|
+| **Dashboard** | KPIs, alerts needing attention, shelf health, 14-day alert trend, top sellers, recent audits |
+| **Alerts** | Filter active/closed alerts; acknowledge, resolve or dismiss with notes; full history |
+| **Inventory** | Searchable stock table; add stock, record sales; days-of-cover and stock-out metrics |
+| **Vision AI** | Upload a shelf photo, run an audit, compare system vs. visual counts per product |
+| **Floor plan** | Place real shelves, cameras, entrances and tills; shelves are coloured by live alert severity |
 
-#### Add Stock
-```bash
-POST /api/stock/add
-Content-Type: application/json
+Everything updates **live**. The API pushes domain events over Server-Sent Events (`GET /api/events`), and pages refetch only what changed. New critical or high alerts also pop a toast on any page. Light and dark themes follow the OS until you choose one.
 
-{
-  "sku": "MILK-001",
-  "quantity": 12,
-  "shelfLabel": "DAIRY-A1"
-}
-```
+---
 
-#### Record Sale
-```bash
-POST /api/stock/sale
-Content-Type: application/json
+## How reconciliation works
 
-{
-  "sku": "MILK-001",
-  "quantity": 2,
-  "orderId": "ORDER-123"
-}
-```
+When an audit completes, each product's visual count is compared with the book (`backend/src/services/reconciliation.ts`, unit-tested):
 
-#### Get Stock Level
-```bash
-GET /api/stock/:sku
-```
+| Condition | Alert |
+|---|---|
+| Confidence < 0.6 | none: an inconclusive reading never pages anyone |
+| Visual = 0 and book > shelf's phantom threshold | `PHANTOM_STOCK` · CRITICAL |
+| \|book − visual\| > 3 and confidence > 0.8 | `DISCREPANCY` · HIGH |
+| \|book − visual\| ≥ 1 and confidence > 0.7 | `DISCREPANCY` · MEDIUM |
 
-#### Get Sales Velocity
-```bash
-GET /api/stock/:sku/velocity?hours=24
-```
+Other rules:
 
-### Vision Auditing
+- **Low stock.** A sale that leaves stock ≤ `minThreshold` raises `LOW_STOCK` (CRITICAL at zero). Restocking above the threshold auto-resolves it.
+- **One active alert per product and type.** Repeats fold into the existing alert and escalate its severity if things got worse.
+- **POS oversell.** If the till sells more than the book holds, the sale is still recorded (stock floors at 0) and a `DISCREPANCY` alert says the book was understated. Manual sales are rejected instead (409).
+- **Vision failures** are recorded as `FAILED` audits plus a `CAMERA_FAILURE` alert. They are never treated as an empty shelf.
+- **Webhook idempotency.** POS retries of the same order line are ignored.
 
-#### Perform Audit
-```bash
-POST /api/vision/audit
-Content-Type: multipart/form-data
+---
 
-image: [image file]
-shelfLabel: DAIRY-A1
-force: false
-```
+## POS webhook
 
-#### Get Audit History
-```bash
-GET /api/vision/history/:shelfLabel?limit=20&offset=0
-```
+`POST /api/webhooks/pos-sale` with header `x-pos-signature: <hex HMAC-SHA256 of the raw body>` using `POS_WEBHOOK_SECRET`.
 
-### Alert Management
-
-#### Get Alerts
-```bash
-GET /api/alerts?severity=CRITICAL&status=OPEN&limit=50
-```
-
-#### Get Alert Statistics
-```bash
-GET /api/alerts/stats?days=7
-```
-
-#### Acknowledge Alert
-```bash
-POST /api/alerts/:alertId/acknowledge
-Content-Type: application/json
-
-{
-  "acknowledgedBy": "staff-001"
-}
-```
-
-#### Resolve Alert
-```bash
-POST /api/alerts/:alertId/resolve
-Content-Type: application/json
-
-{
-  "resolvedBy": "manager-001",
-  "resolution": "Stock replenished and shelf reorganized"
-}
-```
-
-### Configuration
-
-#### Get Shelf Configuration
-```bash
-GET /api/config/shelf/:shelfLabel
-```
-
-#### Update Shelf Configuration
-```bash
-POST /api/config/shelf/:shelfLabel
-Content-Type: application/json
-
-{
-  "phantomStockThreshold": 5,
-  "lowStockThreshold": 3,
-  "checkIntervalMinutes": 30,
-  "salesTriggerCount": 10,
-  "enableSlack": true,
-  "enableSms": false,
-  "enableEmail": true
-}
-```
-
-### Webhooks
-
-#### POS Sale Webhook
-```bash
-POST /api/webhooks/pos-sale
-Content-Type: application/json
-X-POS-Signature: [HMAC signature]
-
+```json
 {
   "event_type": "order.completed",
-  "data": {
-    "order_id": "ORDER-123",
-    "line_items": [
-      {
-        "sku": "MILK-001",
-        "quantity": 2,
-        "price": 3.99
-      }
-    ]
-  }
+  "data": { "order_id": "ORD-123", "line_items": [{ "sku": "MILK-001", "quantity": 2 }] }
 }
 ```
 
----
+`order.cancelled` and `order.refunded` put stock back. Unknown SKUs are reported per line in `lineErrors` (200). Unexpected server errors return 5xx so the POS retries. Without a secret, verification is skipped in development and every webhook is rejected in production.
 
-## 🔐 Security
-
-### Webhook Signature Verification
-
-The system verifies webhook signatures using HMAC-SHA256:
-
-```typescript
-const signature = crypto
-  .createHmac('sha256', process.env.POS_WEBHOOK_SECRET)
-  .update(JSON.stringify(payload))
-  .digest('hex');
-```
-
-### Environment Variables
-
-Required security settings:
-- `POS_WEBHOOK_SECRET`: Secret for webhook signature verification
-- `OPENAI_API_KEY`: OpenAI API key (keep secure)
-- API keys for notification services
+Full endpoint reference: [docs/API_DOCUMENTATION.md](docs/API_DOCUMENTATION.md).
 
 ---
 
-## 🧠 Business Logic
+## Configuration
 
-### Phantom Stock Detection
+See [`backend/.env.example`](backend/.env.example). The main settings:
 
-```typescript
-if (visualCount === 0 && systemCount > threshold) {
-  // CRITICAL ALERT: Database shows stock, shelf is empty
-  triggerPhantomStockAlert();
-}
-```
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection string |
+| `OPENAI_API_KEY` / `OPENAI_VISION_MODEL` | Vision provider (default model `gpt-4o`) |
+| `VISION_PROVIDER=mock` | Fake vision results for development |
+| `POS_WEBHOOK_SECRET` | HMAC secret for POS webhooks (required in production) |
+| `CORS_ORIGIN` | Comma-separated dashboard origins (default `http://localhost:3001`) |
+| `SLACK_WEBHOOK_URL`, `TWILIO_*`, `SENDGRID_API_KEY`, … | Notification channels; each is skipped when unset |
 
-### Reconciliation Rules
-
-| Condition | Alert Type | Severity |
-|-----------|-----------|----------|
-| Visual = 0, System > 5 | PHANTOM_STOCK | CRITICAL |
-| Discrepancy > 3, Confidence > 0.8 | DISCREPANCY | HIGH |
-| Stock ≤ minThreshold | LOW_STOCK | HIGH |
-| Stock > maxCapacity | OVERSTOCKED | MEDIUM |
-
-### Vision Audit Triggers
-
-1. **Time-based:** Every N minutes (configurable per shelf)
-2. **Sales-based:** After N sales of a product
-3. **Manual:** Force audit via API
+The frontend reads `VITE_API_URL` when the API is on another origin; otherwise it uses the Vite proxy.
 
 ---
 
-## 🔔 Notifications
-
-### Slack Integration
-
-Set `SLACK_WEBHOOK_URL` in environment:
-```env
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
-```
-
-### SMS (Twilio)
-
-For critical alerts only:
-```env
-TWILIO_ACCOUNT_SID=your_account_sid
-TWILIO_AUTH_TOKEN=your_auth_token
-TWILIO_FROM_NUMBER=+1234567890
-ALERT_SMS_NUMBER=+1234567890
-```
-
-### Email (SendGrid)
-
-```env
-SENDGRID_API_KEY=your_api_key
-EMAIL_FROM=alerts@yourcompany.com
-ALERT_EMAIL_TO=manager@yourcompany.com
-```
-
----
-
-## 📊 Database Schema
-
-Key models:
-- **Product:** SKU, stock levels, thresholds
-- **Shelf:** Physical location, camera URL, configuration
-- **AuditLog:** System vs. visual count comparisons
-- **Alert:** Notification history and resolution tracking
-- **SaleEvent:** Transaction history
-- **WebhookLog:** Incoming webhook audit trail
-
----
-
-## 🧪 Development
-
-### Local Development
+## Development
 
 ```bash
-# Start in dev mode
+# backend
+npm run dev            # watch mode
+npm test               # unit tests (jest)
+npm run typecheck
+npm run lint
+npx prisma studio      # browse data
+npx prisma migrate dev --name <change>   # after editing schema.prisma
+
+# frontend
 npm run dev
-
-# Run Prisma Studio
-npm run prisma:studio
-
-# Generate Prisma Client
-npm run prisma:generate
-
-# Create migration
-npm run prisma:migrate
-
-# Run tests
-npm test
+npm run build          # typecheck + production bundle
+npm run lint
 ```
 
-### Database Management
+### Project layout
 
-```bash
-# View data
-docker-compose exec app npx prisma studio
-
-# Reset database (CAUTION: Deletes all data)
-docker-compose exec app npx prisma migrate reset
-
-# Check migration status
-docker-compose exec app npx prisma migrate status
 ```
-
----
-
-## 📈 Monitoring
-
-### Health Checks
-
-```bash
-# Application health
-curl http://localhost:3000/health
-
-# Webhook handler health
-curl http://localhost:3000/api/webhooks/health
+backend/
+  prisma/schema.prisma, migrations/, seed.ts
+  src/
+    app.ts, server.ts         routes, middleware, startup/shutdown
+    controllers/              HTTP handlers (thin)
+    services/                 inventory, alerts, reconciliation, vision, analytics, …
+    lib/                      shared Prisma client, SSE event bus
+    validation/schemas.ts     zod request schemas
+    webhooks/                 POS webhook handler
+frontend/src/
+  api/                        typed API client + response types
+  context/                    theme, live events (SSE), toasts
+  hooks/useQuery.ts           fetch + live refresh
+  components/ui/              icons, badges, modal, stat cards, states
+  pages/                      Dashboard, Alerts, Inventory, VisionAI, FloorPlan
 ```
-
-### Logs
-
-```bash
-# View all logs
-docker-compose logs -f
-
-# View app logs only
-docker-compose logs -f app
-
-# View last 100 lines
-docker-compose logs --tail=100 app
-```
-
-### Metrics
-
-The application logs structured JSON, making it compatible with:
-- ELK Stack (Elasticsearch, Logstash, Kibana)
-- Grafana + Loki
-- Datadog
-- CloudWatch
-
----
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-**Database connection failed:**
-```bash
-# Check PostgreSQL is running
-docker-compose ps postgres
-
-# View database logs
-docker-compose logs postgres
-```
-
-**Webhook signature verification fails:**
-- Verify `POS_WEBHOOK_SECRET` matches POS system configuration
-- Check signature header: `X-POS-Signature`
-
-**Vision AI errors:**
-- Verify `OPENAI_API_KEY` is valid
-- Check image file size (max 10MB)
-- Ensure supported formats: JPG, PNG, WebP
-
----
-
-## 🔄 Upgrade Path from v1.0
-
-### Breaking Changes
-
-1. **Database:** SQLite → PostgreSQL
-2. **Vision Service:** Mock → Real OpenAI integration
-3. **Webhooks:** Standalone → Integrated with validation
-4. **Alerts:** Basic logging → Multi-channel notifications
-
-### Migration Steps
-
-1. Export data from v1.0 SQLite database
-2. Set up PostgreSQL in docker-compose
-3. Run Prisma migrations
-4. Import data using seed script
-5. Configure notification channels
-6. Update POS webhook URL
-
----
-
-## 📝 License
-
-MIT
-
----
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
-
----
-
-## 📧 Support
-
-For issues and questions:
-- Create an issue in GitHub
-- Email: support@yourcompany.com
-
----
-
-**Built with ❤️ for retail excellence**

@@ -297,7 +297,7 @@ Create a new shelf in the system.
 ### List Shelves
 **GET** `/api/shelves?zone=Dairy&limit=50&offset=0`
 
-List all shelves with optional filtering.
+List all shelves with optional filtering. Each shelf includes its `products`, `alertConfig`, floor-plan position (`posX`, `posY`) and a live health summary: `openAlerts`, `worstSeverity` (most severe active alert, or `null`) and `auditDue`.
 
 **Response:** `200 OK`
 ```json
@@ -380,9 +380,11 @@ Upload an image and perform AI-powered shelf audit.
 **Content-Type:** `multipart/form-data`
 
 **Form Data:**
-- `image`: Image file (JPG, PNG, max 10MB)
+- `image`: Image file (JPEG, PNG, WebP or GIF, max 10MB). Stored and served at `/uploads/<file>`.
 - `shelfLabel`: Shelf identifier
-- `force`: Force audit even if recently scanned (optional, default: false)
+- `force`: `"true"` to audit even if recently scanned (optional, default: false)
+
+Requires a vision provider: `OPENAI_API_KEY`, or `VISION_PROVIDER=mock` in development. Otherwise `503`. Limited to 20 audits per minute per IP.
 
 **Response:** `200 OK`
 ```json
@@ -390,6 +392,8 @@ Upload an image and perform AI-powered shelf audit.
   "message": "Audit completed successfully",
   "shelfLabel": "DAIRY-A1",
   "timestamp": "2024-01-15T10:35:00Z",
+  "imageUrl": "/uploads/1705314900000-6f1c….jpg",
+  "provider": "openai",
   "summary": [
     {
       "productId": "prod_123",
@@ -399,16 +403,20 @@ Upload an image and perform AI-powered shelf audit.
       "visualCount": 33,
       "discrepancy": 1,
       "status": "FULL",
-      "confidence": 0.92
+      "confidence": 0.92,
+      "alertType": null
     }
   ],
   "metadata": {
     "totalProducts": 12,
     "productsDetected": 12,
-    "averageConfidence": "0.89"
+    "averageConfidence": 0.89,
+    "alertsRaised": 0
   }
 }
 ```
+
+**Error Response:** `502 Bad Gateway`: the vision provider failed. The failure is recorded as `FAILED` audit logs plus a `CAMERA_FAILURE` alert. Counts are never guessed.
 
 **Error Response:** `429 Too Many Requests`
 ```json
@@ -418,6 +426,22 @@ Upload an image and perform AI-powered shelf audit.
   "nextAuditAt": "2024-01-15T11:00:00Z"
 }
 ```
+
+---
+
+### Vision Status
+**GET** `/api/vision/status`
+
+```json
+{ "data": { "enabled": true, "provider": "openai" } }
+```
+
+---
+
+### Recent Audits (all shelves)
+**GET** `/api/vision/audits?limit=50&offset=0`
+
+Audit logs across all shelves, newest first, with `product` and `shelf` included.
 
 ---
 
@@ -461,7 +485,9 @@ List alerts with optional filtering.
 **Query Parameters:**
 - `severity`: CRITICAL, HIGH, MEDIUM, LOW
 - `status`: OPEN, ACKNOWLEDGED, IN_PROGRESS, RESOLVED, DISMISSED
-- `limit`: Results per page (default: 50)
+- `statuses`: comma-separated list, e.g. `OPEN,ACKNOWLEDGED` (ignored when `status` is set)
+- `shelfLabel`: only alerts for this shelf
+- `limit`: Results per page (default: 50, max 200)
 - `offset`: Pagination offset (default: 0)
 
 **Response:** `200 OK`
@@ -523,7 +549,7 @@ Get alert statistics and trends.
 ### Acknowledge Alert
 **POST** `/api/alerts/:alertId/acknowledge`
 
-Mark an alert as acknowledged.
+Mark an `OPEN` alert as acknowledged. Records `acknowledgedBy`/`acknowledgedAt`. Returns `409` if the alert is not open.
 
 **Request Body:**
 ```json
@@ -537,15 +563,18 @@ Mark an alert as acknowledged.
 ### Resolve Alert
 **POST** `/api/alerts/:alertId/resolve`
 
-Resolve an alert with notes.
+Resolve an active alert with notes (≥ 10 characters). Pass `"dismiss": true` to close it as a false positive (`DISMISSED`). Returns `409` if it is already closed.
 
 **Request Body:**
 ```json
 {
   "resolvedBy": "manager-001",
-  "resolution": "Stock replenished. Verified 25 units on shelf."
+  "resolution": "Stock replenished. Verified 25 units on shelf.",
+  "dismiss": false
 }
 ```
+
+Alerts are deduplicated: there is at most one active alert per product and type. A repeat condition escalates the existing alert's severity instead of creating a new one. `LOW_STOCK` alerts auto-resolve when the product is restocked above its threshold.
 
 ---
 
@@ -718,7 +747,9 @@ Generate a complete analytics report.
 Receive POS sale events.
 
 **Headers:**
-- `X-POS-Signature`: HMAC-SHA256 signature of the payload
+- `X-POS-Signature`: hex HMAC-SHA256 of the **raw request body** using `POS_WEBHOOK_SECRET` (an optional `sha256=` prefix is accepted). Required in production.
+
+Order lines are idempotent per `order_id` + SKU, so retries are safe. If a completed order sells more than the book holds, the sale is recorded with stock floored at 0, and a `DISCREPANCY` alert is raised.
 
 **Request Body:**
 ```json
@@ -742,9 +773,12 @@ Receive POS sale events.
 ```json
 {
   "status": "ACK",
-  "correlationId": "abc-123-xyz"
+  "correlationId": "abc-123-xyz",
+  "lineErrors": ["GHOST-1: Product with SKU GHOST-1 not found"]
 }
 ```
+
+`401` invalid signature · `400` invalid payload · `500` unexpected failure (the POS should retry).
 
 ---
 
@@ -757,10 +791,12 @@ Check webhook handler status.
 
 ## Configuration
 
+These are aliases of `GET/POST /api/shelves/:label/config`.
+
 ### Get Shelf Configuration
 **GET** `/api/config/shelf/:shelfLabel`
 
-Get alert and audit configuration for a shelf.
+Get alert and audit configuration for a shelf. Returns defaults (with `isDefault: true`) when none is stored.
 
 ---
 
@@ -779,6 +815,38 @@ Update shelf configuration.
   "enableSlack": true,
   "enableSms": false,
   "enableEmail": true
+}
+```
+
+All fields are optional; unknown fields are rejected.
+
+---
+
+## Live Events
+
+**GET** `/api/events`: a Server-Sent Events stream. Each event has a type and a small JSON payload. Clients refetch whatever they display.
+
+| Event | Payload |
+|---|---|
+| `stock.changed` | `sku`, `stock`, `reason` (`restock` / `sale` / `return` / `adjustment`) |
+| `alert.created` | `alertId`, `severity`, `alertType`, `shelfLabel` |
+| `alert.updated` | `alertId`, `status` |
+| `audit.completed` | `shelfLabel`, `itemsAudited` |
+| `shelf.changed` | `label` |
+| `floorplan.changed` | — |
+
+---
+
+## Floor Plan
+
+**GET** `/api/floor-plan`: the walls and points of interest (cameras, entrances, checkouts). Shelf positions come from `GET /api/shelves` (`posX`, `posY`).
+
+**PUT** `/api/floor-plan`
+```json
+{
+  "walls": [{ "id": "w1", "x1": 40, "y1": 40, "x2": 760, "y2": 40 }],
+  "points": [{ "id": "p1", "type": "camera", "label": "CAM-01", "x": 225, "y": 80, "cameraUrl": "rtsp://…" }],
+  "shelves": [{ "label": "DAIRY-A1", "x": 150, "y": 140 }]
 }
 ```
 
@@ -825,17 +893,11 @@ Update shelf configuration.
 
 ## Rate Limits
 
-- **Standard API**: 100 requests per 15 minutes per IP
-- **Webhooks**: 60 requests per minute per IP
+- **Standard API**: 2000 requests per 15 minutes per IP (`RATE_LIMIT_MAX`)
+- **Vision audits**: 20 per minute per IP
+- **Webhooks**: 600 per minute per IP
+- `/api/events` is not rate limited
 
 ---
 
-## Postman Collection
-
-Import the provided Postman collection for easy testing:
-[Download Postman Collection](./postman_collection.json)
-
----
-
-**Last Updated:** 2024
-**API Version:** 2.0
+**API Version:** 2.1

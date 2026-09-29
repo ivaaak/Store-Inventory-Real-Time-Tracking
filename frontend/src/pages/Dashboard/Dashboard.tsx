@@ -1,113 +1,277 @@
+import { Link } from 'react-router-dom';
+import { api, ApiError } from '../../api/client';
+import type { Shelf } from '../../api/types';
+import { useQuery } from '../../hooks/useQuery';
+import { alertTypeLabel, formatCurrency, formatNumber, formatPercent, timeAgo } from '../../lib/format';
+import { EmptyState, ErrorState, Icon, Loading, SeverityBadge, StatCard, StockMeter } from '../../components/ui';
+import { AlertTrendChart } from './AlertTrendChart';
 import styles from './Dashboard.module.css';
 
-const Dashboard = () => {
-  const alerts = [
-    { id: '1', severity: 'CRITICAL', type: 'PHANTOM_STOCK', shelf: 'DAIRY-A1', sku: 'MILK-001', time: '5m ago' },
-    { id: '2', severity: 'HIGH', type: 'DISCREPANCY', shelf: 'DAIRY-A2', sku: 'CHEESE-001', time: '15m ago' },
-    { id: '3', severity: 'HIGH', type: 'LOW_STOCK', shelf: 'BAKERY-B1', sku: 'BREAD-001', time: '1h ago' },
-  ];
+const shelfFill = (shelf: Shelf) => {
+  const stock = shelf.products.reduce((s, p) => s + p.stock, 0);
+  const max = shelf.products.reduce((s, p) => s + p.maxCapacity, 0);
+  return { stock, max };
+};
 
-  const recentAudits = [
-    { id: '1', shelf: 'DAIRY-A1', status: 'phantom', time: '10m ago', confidence: 95 },
-    { id: '2', shelf: 'DAIRY-A2', status: 'match', time: '25m ago', confidence: 92 },
-    { id: '3', shelf: 'BAKERY-B1', status: 'discrepancy', time: '1h ago', confidence: 88 },
-  ];
+const Dashboard = () => {
+  const overview = useQuery(() => api.dashboard(7).then((r) => r.data), [], {
+    liveOn: ['stock.changed', 'alert.created', 'alert.updated', 'audit.completed', 'shelf.changed'],
+  });
+  const trends = useQuery(() => api.alertTrends(14).then((r) => r.data), [], { liveOn: ['alert.created'] });
+  const alerts = useQuery(() => api.alerts({ statuses: 'OPEN,ACKNOWLEDGED,IN_PROGRESS', limit: 6 }).then((r) => r.data), [], {
+    liveOn: ['alert.created', 'alert.updated'],
+  });
+  const shelves = useQuery(() => api.shelves().then((r) => r.data), [], {
+    liveOn: ['stock.changed', 'alert.created', 'alert.updated', 'audit.completed', 'shelf.changed'],
+  });
+  const audits = useQuery(() => api.recentAudits(8).then((r) => r.data), [], { liveOn: ['audit.completed'] });
+  const movement = useQuery(() => api.stockMovement(7).then((r) => r.data), [], { liveOn: ['stock.changed'] });
+
+  if (overview.error && !overview.data) {
+    const offline = overview.error instanceof ApiError === false;
+    return (
+      <div className="page">
+        <div className="card">
+          <ErrorState
+            error={offline ? new Error('The API is unreachable. Is the backend running on port 3000?') : overview.error}
+            onRetry={overview.refetch}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  const o = overview.data;
 
   return (
-    <div className={styles.container}>
-      <div className={styles.header}>
-        <h1 className={styles.title}>Dashboard</h1>
-        <div className={styles.timestamp}>
-          Last updated: {new Date().toLocaleTimeString()}
-        </div>
-      </div>
-
-      <div className={styles.metrics}>
-        <div className={styles.metricCard}>
-          <div className={styles.metricIcon}>🚨</div>
-          <div className={styles.metricContent}>
-            <div className={styles.metricValue}>3</div>
-            <div className={styles.metricLabel}>Active Alerts</div>
-          </div>
-        </div>
-
-        <div className={styles.metricCard}>
-          <div className={styles.metricIcon}>📦</div>
-          <div className={styles.metricContent}>
-            <div className={styles.metricValue}>24</div>
-            <div className={styles.metricLabel}>Monitored Shelves</div>
-          </div>
-        </div>
-
-        <div className={styles.metricCard}>
-          <div className={styles.metricIcon}>👁️</div>
-          <div className={styles.metricContent}>
-            <div className={styles.metricValue}>142</div>
-            <div className={styles.metricLabel}>Audits Today</div>
-          </div>
-        </div>
-
-        <div className={styles.metricCard}>
-          <div className={styles.metricIcon}>📊</div>
-          <div className={styles.metricContent}>
-            <div className={styles.metricValue}>94%</div>
-            <div className={styles.metricLabel}>Accuracy Rate</div>
+    <div className="page">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">Dashboard</h1>
+          <div className="page-subtitle">
+            Store overview · {overview.updatedAt ? `updated ${overview.updatedAt.toLocaleTimeString()}` : 'loading…'}
           </div>
         </div>
       </div>
+
+      <section className={styles.kpis} aria-label="Key metrics">
+        {o ? (
+          <>
+            <StatCard
+              label="Active alerts"
+              icon="bell"
+              value={o.alerts.open}
+              hint={o.alerts.critical ? `${o.alerts.critical} critical` : 'None critical'}
+              tone={o.alerts.critical ? 'danger' : undefined}
+              to="/alerts"
+            />
+            <StatCard
+              label="Out of / low stock"
+              icon="package"
+              value={
+                <>
+                  {o.inventory.outOfStockProducts}
+                  <span className={styles.kpiSep}>/</span>
+                  {o.inventory.lowStockProducts}
+                </>
+              }
+              hint={`of ${o.inventory.totalProducts} products`}
+              tone={o.inventory.outOfStockProducts ? 'warning' : undefined}
+              to="/inventory"
+            />
+            <StatCard
+              label="Shelves due for audit"
+              icon="scan"
+              value={o.shelves.needingAudit}
+              hint={`of ${o.shelves.total} shelves`}
+              to="/vision-ai"
+            />
+            <StatCard
+              label="Audits today"
+              icon="eye"
+              value={o.audits.today}
+              hint={`Avg. confidence ${formatPercent(o.audits.averageConfidence)} (7d)`}
+            />
+            <StatCard
+              label="Stock value"
+              icon="activity"
+              value={formatCurrency(o.inventory.stockValue)}
+              hint={`${formatNumber(o.sales.totalQuantity)} units sold (7d)`}
+            />
+          </>
+        ) : (
+          Array.from({ length: 5 }, (_, i) => <div key={i} className={`card skeleton ${styles.kpiSkeleton}`} />)
+        )}
+      </section>
 
       <div className={styles.grid}>
-        <div className={styles.panel}>
-          <div className={styles.panelHeader}>
-            <h2 className={styles.panelTitle}>Recent Alerts</h2>
-            <a href="/alerts" className={styles.link}>View All →</a>
+        <section className={`card ${styles.span2}`}>
+          <div className="card-header">
+            <h2 className="card-title">Needs attention</h2>
+            <Link to="/alerts" className={styles.link}>
+              All alerts <Icon name="arrowRight" size={14} />
+            </Link>
           </div>
-          <div className={styles.alertsList}>
-            {alerts.map(alert => (
-              <div key={alert.id} className={styles.alertItem}>
-                <div className={`${styles.alertSeverity} ${styles[`severity${alert.severity}`]}`}>
-                  {alert.severity}
-                </div>
-                <div className={styles.alertContent}>
-                  <div className={styles.alertType}>{alert.type.replace('_', ' ')}</div>
-                  <div className={styles.alertDetails}>
-                    {alert.shelf} • {alert.sku}
+          {alerts.loading ? (
+            <Loading />
+          ) : !alerts.data?.length ? (
+            <EmptyState icon="check" title="All clear">
+              No active alerts right now.
+            </EmptyState>
+          ) : (
+            <ul className={styles.alertList}>
+              {alerts.data.map((a) => (
+                <li key={a.id}>
+                  <Link to={`/alerts?id=${a.id}`} className={styles.alertRow}>
+                    <SeverityBadge severity={a.severity} />
+                    <div className={styles.alertMain}>
+                      <div className={styles.alertType}>
+                        {alertTypeLabel(a.type)}
+                        {a.status !== 'OPEN' && <span className="muted"> · {a.status.toLowerCase()}</span>}
+                      </div>
+                      <div className={styles.alertMeta}>
+                        <span className="mono">{a.shelfLabel}</span> · {a.product?.name ?? a.productId}
+                      </div>
+                    </div>
+                    <span className={styles.alertTime}>{timeAgo(a.createdAt)}</span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <section className="card">
+          <div className="card-header">
+            <h2 className="card-title">Shelf health</h2>
+            <Link to="/floor-plan" className={styles.link}>
+              Floor plan <Icon name="arrowRight" size={14} />
+            </Link>
+          </div>
+          {shelves.loading ? (
+            <Loading />
+          ) : !shelves.data?.length ? (
+            <EmptyState icon="shelf" title="No shelves yet" />
+          ) : (
+            <ul className={styles.shelfList}>
+              {shelves.data.map((s) => {
+                const { stock, max } = shelfFill(s);
+                const ratio = max ? stock / max : 0;
+                return (
+                  <li key={s.id} className={styles.shelfRow}>
+                    <div className={styles.shelfHead}>
+                      <span className="mono">{s.label}</span>
+                      <span className={styles.shelfZone}>{s.zone}</span>
+                      <span className={styles.shelfBadges}>
+                        {s.worstSeverity && <SeverityBadge severity={s.worstSeverity} />}
+                        {s.auditDue && <span className="badge">Audit due</span>}
+                      </span>
+                    </div>
+                    <StockMeter stock={stock} max={max} status={ratio < 0.15 ? 'LOW' : ratio > 1 ? 'OVER' : 'OK'} />
+                    <div className={styles.shelfMeta}>
+                      <span className="num">{Math.round(ratio * 100)}% full</span>
+                      <span>scanned {timeAgo(s.lastScanned)}</span>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
+
+        <section className={`card ${styles.span2}`}>
+          <div className="card-header">
+            <h2 className="card-title">Alerts raised · last 14 days</h2>
+          </div>
+          <div className="card-body">
+            {trends.error ? (
+              <ErrorState error={trends.error} onRetry={trends.refetch} />
+            ) : trends.data ? (
+              <AlertTrendChart data={trends.data} />
+            ) : (
+              <div className="skeleton" style={{ height: 220 }} />
+            )}
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-header">
+            <h2 className="card-title">Top sellers · 7 days</h2>
+          </div>
+          {movement.loading ? (
+            <Loading />
+          ) : !movement.data?.topSellingProducts.length ? (
+            <EmptyState icon="cart" title="No sales recorded" />
+          ) : (
+            <ol className={styles.topList}>
+              {movement.data.topSellingProducts.slice(0, 6).map((p, i, arr) => (
+                <li key={p.sku} className={styles.topRow}>
+                  <span className={styles.topRank}>{i + 1}</span>
+                  <div className={styles.topMain}>
+                    <div className={styles.topName}>{p.name}</div>
+                    <div className="meter">
+                      <span style={{ width: `${(p.totalSold / arr[0].totalSold) * 100}%`, ['--meter-color' as string]: 'var(--color-primary)' }} />
+                    </div>
                   </div>
-                </div>
-                <div className={styles.alertTime}>{alert.time}</div>
-              </div>
-            ))}
-          </div>
-        </div>
+                  <span className="num">{p.totalSold}</span>
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
 
-        <div className={styles.panel}>
-          <div className={styles.panelHeader}>
-            <h2 className={styles.panelTitle}>Recent Audits</h2>
-            <a href="/vision-ai" className={styles.link}>View All →</a>
+        <section className={`card ${styles.span3}`}>
+          <div className="card-header">
+            <h2 className="card-title">Recent audits</h2>
+            <Link to="/vision-ai" className={styles.link}>
+              Vision AI <Icon name="arrowRight" size={14} />
+            </Link>
           </div>
-          <div className={styles.auditsList}>
-            {recentAudits.map(audit => (
-              <div key={audit.id} className={styles.auditItem}>
-                <div className={styles.auditShelf}>{audit.shelf}</div>
-                <div className={`${styles.auditStatus} ${styles[`status${audit.status}`]}`}>
-                  {audit.status}
-                </div>
-                <div className={styles.auditConfidence}>{audit.confidence}%</div>
-                <div className={styles.auditTime}>{audit.time}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      <div className={styles.panel}>
-        <div className={styles.panelHeader}>
-          <h2 className={styles.panelTitle}>Stock Overview</h2>
-        </div>
-        <div className={styles.chartPlaceholder}>
-          <div className={styles.chartIcon}>📊</div>
-          <div className={styles.chartText}>Stock trends chart would go here</div>
-        </div>
+          {audits.loading ? (
+            <Loading />
+          ) : !audits.data?.length ? (
+            <EmptyState icon="eye" title="No audits yet" />
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Shelf</th>
+                    <th>Product</th>
+                    <th className="right">System</th>
+                    <th className="right">Visual</th>
+                    <th className="right">Confidence</th>
+                    <th>Result</th>
+                    <th className="right">When</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {audits.data.map((a) => (
+                    <tr key={a.id}>
+                      <td className="mono">{a.shelf?.label}</td>
+                      <td>{a.product.name}</td>
+                      <td className="right num">{a.systemCount}</td>
+                      <td className="right num">{a.status === 'FAILED' ? '—' : a.visualCount}</td>
+                      <td className="right num">{formatPercent(a.confidence)}</td>
+                      <td>
+                        {a.status === 'FAILED' ? (
+                          <span className="badge badge-danger">Failed</span>
+                        ) : a.alertType ? (
+                          <span className="badge badge-warning">{alertTypeLabel(a.alertType)}</span>
+                        ) : a.discrepancy === 0 ? (
+                          <span className="badge badge-success">Match</span>
+                        ) : (
+                          <span className="badge">Off by {Math.abs(a.discrepancy)}</span>
+                        )}
+                      </td>
+                      <td className="right muted">{timeAgo(a.createdAt)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
       </div>
     </div>
   );

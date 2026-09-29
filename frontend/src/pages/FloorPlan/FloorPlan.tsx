@@ -1,447 +1,509 @@
-import { useState, useRef, useEffect } from 'react';
+import { PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { api } from '../../api/client';
+import type { FloorPlanPoint, FloorPlanWall, Shelf } from '../../api/types';
+import { useQuery } from '../../hooks/useQuery';
+import { useToast } from '../../context/ToastContext';
+import { timeAgo } from '../../lib/format';
+import { EmptyState, ErrorState, Icon, IconName, Loading, SeverityBadge, StockMeter } from '../../components/ui';
 import styles from './FloorPlan.module.css';
 
-interface Point {
-  id: string;
-  x: number;
-  y: number;
-  label: string;
-  type: 'shelf' | 'camera' | 'entrance' | 'checkout';
-  sku?: string;
-  cameraUrl?: string;
-}
+const W = 800;
+const H = 600;
+const GRID = 20;
+const SHELF_W = 96;
+const SHELF_H = 38;
 
-interface Wall {
-  id: string;
-  x1: number;
-  y1: number;
-  x2: number;
-  y2: number;
-}
+type Tool = 'select' | 'wall' | 'camera' | 'entrance' | 'checkout' | 'place';
+type Selection = { kind: 'shelf'; label: string } | { kind: 'point'; id: string } | { kind: 'wall'; id: string } | null;
+type Drag = { kind: 'shelf'; label: string; dx: number; dy: number } | { kind: 'point'; id: string; dx: number; dy: number } | null;
+
+const TOOLS: Array<{ id: Tool; label: string; icon: IconName }> = [
+  { id: 'select', label: 'Select & move', icon: 'pointer' },
+  { id: 'wall', label: 'Draw wall', icon: 'wall' },
+  { id: 'camera', label: 'Add camera', icon: 'camera' },
+  { id: 'entrance', label: 'Add entrance', icon: 'door' },
+  { id: 'checkout', label: 'Add checkout', icon: 'register' },
+];
+
+const POINT_ICON: Record<FloorPlanPoint['type'], IconName> = { camera: 'camera', entrance: 'door', checkout: 'register' };
+const POINT_LABEL: Record<FloorPlanPoint['type'], string> = { camera: 'Camera', entrance: 'Entrance', checkout: 'Checkout' };
+
+const snap = (v: number) => Math.round(v / GRID) * GRID;
+const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
+const uid = () => Math.random().toString(36).slice(2, 10);
 
 const FloorPlan = () => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [points, setPoints] = useState<Point[]>([
-    { id: '1', x: 150, y: 200, label: 'DAIRY-A1', type: 'shelf', sku: 'MILK-001' },
-    { id: '2', x: 350, y: 200, label: 'DAIRY-A2', type: 'shelf', sku: 'CHEESE-001' },
-    { id: '3', x: 150, y: 400, label: 'CAM-01', type: 'camera', cameraUrl: 'rtsp://cam1' },
-    { id: '4', x: 500, y: 100, label: 'Entrance', type: 'entrance' },
-  ]);
-  const [walls, setWalls] = useState<Wall[]>([
-    { id: 'w1', x1: 50, y1: 50, x2: 550, y2: 50 },
-    { id: 'w2', x1: 550, y1: 50, x2: 550, y2: 550 },
-    { id: 'w3', x1: 550, y1: 550, x2: 50, y2: 550 },
-    { id: 'w4', x1: 50, y1: 550, x2: 50, y2: 50 },
-  ]);
-  
-  const [selectedPoint, setSelectedPoint] = useState<string | null>(null);
-  const [mode, setMode] = useState<'select' | 'addShelf' | 'addCamera' | 'addWall'>('select');
-  const [isDragging, setIsDragging] = useState(false);
-  const [showAddDialog, setShowAddDialog] = useState(false);
-  const [newPointData, setNewPointData] = useState({ label: '', sku: '', cameraUrl: '' });
-  const [tempWallStart, setTempWallStart] = useState<{ x: number; y: number } | null>(null);
+  const notify = useToast();
+  const svgRef = useRef<SVGSVGElement>(null);
+
+  const plan = useQuery(() => api.floorPlan().then((r) => r.data), []);
+  const shelves = useQuery(() => api.shelves().then((r) => r.data), [], {
+    liveOn: ['shelf.changed', 'alert.created', 'alert.updated', 'stock.changed', 'audit.completed'],
+  });
+
+  const [walls, setWalls] = useState<FloorPlanWall[]>([]);
+  const [points, setPoints] = useState<FloorPlanPoint[]>([]);
+  // Local shelf positions; server positions are the fallback.
+  const [shelfPos, setShelfPos] = useState<Record<string, { x: number; y: number }>>({});
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const [tool, setTool] = useState<Tool>('select');
+  const [selection, setSelection] = useState<Selection>(null);
+  const [drag, setDrag] = useState<Drag>(null);
+  const [wallStart, setWallStart] = useState<{ x: number; y: number } | null>(null);
+  const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
+  const [placing, setPlacing] = useState<string | null>(null);
+
+  const resetFromServer = useCallback(() => {
+    if (!plan.data) return;
+    setWalls(plan.data.walls);
+    setPoints(plan.data.points);
+    setShelfPos({});
+    setDirty(false);
+    setSelection(null);
+  }, [plan.data]);
+
+  useEffect(resetFromServer, [resetFromServer]);
+
+  const positioned = useMemo(
+    () =>
+      (shelves.data ?? [])
+        .map((s) => {
+          const pos = shelfPos[s.label] ?? (s.posX !== null && s.posY !== null ? { x: s.posX, y: s.posY } : null);
+          return pos ? { shelf: s, ...pos } : null;
+        })
+        .filter(Boolean) as Array<{ shelf: Shelf; x: number; y: number }>,
+    [shelves.data, shelfPos]
+  );
+  const unplaced = (shelves.data ?? []).filter((s) => !positioned.some((p) => p.shelf.id === s.id));
+
+  const toSvg = (e: { clientX: number; clientY: number }) => {
+    const svg = svgRef.current!;
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX;
+    pt.y = e.clientY;
+    const p = pt.matrixTransform(svg.getScreenCTM()!.inverse());
+    return { x: clamp(p.x, 0, W), y: clamp(p.y, 0, H) };
+  };
+
+  const changeTool = (t: Tool) => {
+    setTool(t);
+    setWallStart(null);
+    if (t !== 'place') setPlacing(null);
+  };
+
+  const onCanvasPointerDown = (e: ReactPointerEvent<SVGSVGElement>) => {
+    if (e.button !== 0) return;
+    const { x, y } = toSvg(e);
+    const sx = snap(x);
+    const sy = snap(y);
+
+    if (tool === 'select') {
+      setSelection(null);
+    } else if (tool === 'wall') {
+      if (!wallStart) setWallStart({ x: sx, y: sy });
+      else {
+        if (sx !== wallStart.x || sy !== wallStart.y) {
+          setWalls((ws) => [...ws, { id: `w-${uid()}`, x1: wallStart.x, y1: wallStart.y, x2: sx, y2: sy }]);
+          setDirty(true);
+        }
+        // Chain walls: the end of one is the start of the next.
+        setWallStart({ x: sx, y: sy });
+      }
+    } else if (tool === 'place' && placing) {
+      setShelfPos((p) => ({ ...p, [placing]: { x: sx, y: sy } }));
+      setSelection({ kind: 'shelf', label: placing });
+      setPlacing(null);
+      setTool('select');
+      setDirty(true);
+    } else if (tool === 'camera' || tool === 'entrance' || tool === 'checkout') {
+      const count = points.filter((p) => p.type === tool).length + 1;
+      const label = tool === 'camera' ? `CAM-${String(count).padStart(2, '0')}` : tool === 'checkout' ? `Till ${count}` : 'Entrance';
+      const point: FloorPlanPoint = { id: `p-${uid()}`, type: tool, label, x: sx, y: sy };
+      setPoints((ps) => [...ps, point]);
+      setSelection({ kind: 'point', id: point.id });
+      setTool('select');
+      setDirty(true);
+    }
+  };
+
+  const onPointerMove = (e: ReactPointerEvent<SVGSVGElement>) => {
+    const p = toSvg(e);
+    setCursor(p);
+    if (!drag) return;
+    const x = snap(clamp(p.x - drag.dx, 0, W));
+    const y = snap(clamp(p.y - drag.dy, 0, H));
+    if (drag.kind === 'shelf') setShelfPos((s) => ({ ...s, [drag.label]: { x, y } }));
+    else setPoints((ps) => ps.map((pt) => (pt.id === drag.id ? { ...pt, x, y } : pt)));
+    setDirty(true);
+  };
+
+  const startDrag = (e: ReactPointerEvent, target: NonNullable<Selection>, origin: { x: number; y: number }) => {
+    if (tool !== 'select') return;
+    e.stopPropagation();
+    setSelection(target);
+    if (target.kind === 'wall') return;
+    const p = toSvg(e);
+    svgRef.current?.setPointerCapture(e.pointerId);
+    setDrag(
+      target.kind === 'shelf'
+        ? { kind: 'shelf', label: target.label, dx: p.x - origin.x, dy: p.y - origin.y }
+        : { kind: 'point', id: target.id, dx: p.x - origin.x, dy: p.y - origin.y }
+    );
+  };
+
+  const deleteSelection = useCallback(() => {
+    if (!selection || selection.kind === 'shelf') return;
+    if (selection.kind === 'point') setPoints((ps) => ps.filter((p) => p.id !== selection.id));
+    else setWalls((ws) => ws.filter((w) => w.id !== selection.id));
+    setSelection(null);
+    setDirty(true);
+  }, [selection]);
 
   useEffect(() => {
-    drawCanvas();
-  }, [points, walls, selectedPoint, tempWallStart]);
-
-  const drawCanvas = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    // Clear canvas
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    // Draw grid
-    ctx.strokeStyle = '#e5e7eb';
-    ctx.lineWidth = 1;
-    for (let i = 0; i < canvas.width; i += 50) {
-      ctx.beginPath();
-      ctx.moveTo(i, 0);
-      ctx.lineTo(i, canvas.height);
-      ctx.stroke();
-    }
-    for (let i = 0; i < canvas.height; i += 50) {
-      ctx.beginPath();
-      ctx.moveTo(0, i);
-      ctx.lineTo(canvas.width, i);
-      ctx.stroke();
-    }
-
-    // Draw walls
-    ctx.strokeStyle = '#374151';
-    ctx.lineWidth = 4;
-    walls.forEach(wall => {
-      ctx.beginPath();
-      ctx.moveTo(wall.x1, wall.y1);
-      ctx.lineTo(wall.x2, wall.y2);
-      ctx.stroke();
-    });
-
-    // Draw temporary wall
-    if (tempWallStart) {
-      ctx.strokeStyle = '#6b7280';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([5, 5]);
-      ctx.beginPath();
-      ctx.moveTo(tempWallStart.x, tempWallStart.y);
-      ctx.lineTo(tempWallStart.x + 100, tempWallStart.y);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-
-    // Draw points
-    points.forEach(point => {
-      const isSelected = selectedPoint === point.id;
-      
-      // Point background
-      ctx.fillStyle = getPointColor(point.type);
-      ctx.beginPath();
-      ctx.arc(point.x, point.y, isSelected ? 16 : 12, 0, 2 * Math.PI);
-      ctx.fill();
-
-      // Point border
-      if (isSelected) {
-        ctx.strokeStyle = '#2563eb';
-        ctx.lineWidth = 3;
-        ctx.stroke();
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement).closest('input, textarea, select')) return;
+      if (e.key === 'Escape') {
+        setWallStart(null);
+        setPlacing(null);
+        setTool('select');
       }
-
-      // Icon
-      ctx.fillStyle = '#ffffff';
-      ctx.font = '16px Arial';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(getPointIcon(point.type), point.x, point.y);
-
-      // Label
-      ctx.fillStyle = '#111827';
-      ctx.font = 'bold 12px Arial';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'top';
-      ctx.fillText(point.label, point.x, point.y + 20);
-    });
-  };
-
-  const getPointColor = (type: string): string => {
-    switch (type) {
-      case 'shelf': return '#10b981';
-      case 'camera': return '#3b82f6';
-      case 'entrance': return '#f59e0b';
-      case 'checkout': return '#8b5cf6';
-      default: return '#6b7280';
-    }
-  };
-
-  const getPointIcon = (type: string): string => {
-    switch (type) {
-      case 'shelf': return '📦';
-      case 'camera': return '📷';
-      case 'entrance': return '🚪';
-      case 'checkout': return '💳';
-      default: return '📍';
-    }
-  };
-
-  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-
-    if (mode === 'select') {
-      // Check if clicking on existing point
-      const clickedPoint = points.find(p => {
-        const distance = Math.sqrt((p.x - x) ** 2 + (p.y - y) ** 2);
-        return distance < 20;
-      });
-      setSelectedPoint(clickedPoint ? clickedPoint.id : null);
-    } else if (mode === 'addShelf' || mode === 'addCamera') {
-      setShowAddDialog(true);
-    } else if (mode === 'addWall') {
-      if (!tempWallStart) {
-        setTempWallStart({ x, y });
-      } else {
-        const newWall: Wall = {
-          id: `w${Date.now()}`,
-          x1: tempWallStart.x,
-          y1: tempWallStart.y,
-          x2: x,
-          y2: y,
-        };
-        setWalls([...walls, newWall]);
-        setTempWallStart(null);
-        setMode('select');
-      }
-    }
-  };
-
-  const handleAddPoint = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const newPoint: Point = {
-      id: `${Date.now()}`,
-      x: 300,
-      y: 300,
-      label: newPointData.label,
-      type: mode === 'addShelf' ? 'shelf' : 'camera',
-      sku: newPointData.sku || undefined,
-      cameraUrl: newPointData.cameraUrl || undefined,
+      if (e.key === 'Delete' || e.key === 'Backspace') deleteSelection();
     };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [deleteSelection]);
 
-    setPoints([...points, newPoint]);
-    setNewPointData({ label: '', sku: '', cameraUrl: '' });
-    setShowAddDialog(false);
-    setMode('select');
-  };
-
-  const handleDeletePoint = () => {
-    if (selectedPoint) {
-      setPoints(points.filter(p => p.id !== selectedPoint));
-      setSelectedPoint(null);
+  const save = async () => {
+    setSaving(true);
+    try {
+      const data = await api.saveFloorPlan({
+        walls,
+        points,
+        shelves: Object.entries(shelfPos).map(([label, p]) => ({ label, ...p })),
+      });
+      await shelves.refetch();
+      setWalls(data.data.walls);
+      setPoints(data.data.points);
+      setShelfPos({});
+      setDirty(false);
+      notify({ kind: 'success', title: 'Floor plan saved' });
+    } catch (err) {
+      notify({ kind: 'error', title: 'Could not save floor plan', message: (err as Error).message });
+    } finally {
+      setSaving(false);
     }
   };
 
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (mode !== 'select') return;
+  if (plan.error || shelves.error) {
+    return (
+      <div className="page">
+        <div className="card">
+          <ErrorState error={(plan.error ?? shelves.error)!} onRetry={() => (plan.refetch(), shelves.refetch())} />
+        </div>
+      </div>
+    );
+  }
 
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+  const selectedShelf = selection?.kind === 'shelf' ? shelves.data?.find((s) => s.label === selection.label) : undefined;
+  const selectedPoint = selection?.kind === 'point' ? points.find((p) => p.id === selection.id) : undefined;
+  const selectedWall = selection?.kind === 'wall' ? walls.find((w) => w.id === selection.id) : undefined;
 
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-
-    const clickedPoint = points.find(p => {
-      const distance = Math.sqrt((p.x - x) ** 2 + (p.y - y) ** 2);
-      return distance < 20;
-    });
-
-    if (clickedPoint) {
-      setSelectedPoint(clickedPoint.id);
-      setIsDragging(true);
-    }
-  };
-
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!isDragging || !selectedPoint) return;
-
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-
-    setPoints(points.map(p => 
-      p.id === selectedPoint ? { ...p, x, y } : p
-    ));
-  };
-
-  const handleMouseUp = () => {
-    setIsDragging(false);
-  };
-
-  const selectedPointData = points.find(p => p.id === selectedPoint);
+  const hint =
+    tool === 'wall'
+      ? wallStart
+        ? 'Click to end the wall (and start the next). Esc to finish.'
+        : 'Click to start a wall.'
+      : tool === 'place'
+        ? `Click to place ${placing}. Esc to cancel.`
+        : tool !== 'select'
+          ? `Click to add a ${POINT_LABEL[tool as FloorPlanPoint['type']].toLowerCase()}.`
+          : 'Drag shelves and markers to move them. Delete removes the selected marker or wall.';
 
   return (
-    <div className={styles.container}>
-      <div className={styles.header}>
-        <h1 className={styles.title}>Floor Plan Editor</h1>
-        <div className={styles.actions}>
-          <button 
-            className={`${styles.btn} ${mode === 'select' ? styles.btnActive : ''}`}
-            onClick={() => setMode('select')}
-          >
-            ✋ Select
+    <div className="page">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">Floor plan</h1>
+          <div className="page-subtitle">Shelves are coloured by their most severe active alert</div>
+        </div>
+        <div className="toolbar">
+          {dirty && <span className="badge badge-warning badge-dot">Unsaved changes</span>}
+          <button className="btn" onClick={resetFromServer} disabled={!dirty || saving}>
+            Discard
           </button>
-          <button 
-            className={`${styles.btn} ${mode === 'addShelf' ? styles.btnActive : ''}`}
-            onClick={() => setMode('addShelf')}
-          >
-            📦 Add Shelf
-          </button>
-          <button 
-            className={`${styles.btn} ${mode === 'addCamera' ? styles.btnActive : ''}`}
-            onClick={() => setMode('addCamera')}
-          >
-            📷 Add Camera
-          </button>
-          <button 
-            className={`${styles.btn} ${mode === 'addWall' ? styles.btnActive : ''}`}
-            onClick={() => setMode('addWall')}
-          >
-            🧱 Add Wall
+          <button className="btn btn-primary" onClick={save} disabled={!dirty || saving}>
+            {saving ? <span className="spinner" /> : <Icon name="save" size={15} />} Save
           </button>
         </div>
       </div>
 
-      <div className={styles.content}>
-        <div className={styles.canvasContainer}>
-          <canvas
-            ref={canvasRef}
-            width={800}
-            height={600}
-            className={styles.canvas}
-            onClick={handleCanvasClick}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseUp}
-          />
-        </div>
-
-        <div className={styles.sidebar}>
-          <div className={styles.panel}>
-            <h3 className={styles.panelTitle}>Properties</h3>
-            {selectedPointData ? (
-              <div className={styles.properties}>
-                <div className={styles.property}>
-                  <label className={styles.label}>Type</label>
-                  <div className={styles.value}>{selectedPointData.type}</div>
-                </div>
-                <div className={styles.property}>
-                  <label className={styles.label}>Label</label>
-                  <input 
-                    type="text" 
-                    className={styles.input}
-                    value={selectedPointData.label}
-                    onChange={(e) => setPoints(points.map(p => 
-                      p.id === selectedPoint ? { ...p, label: e.target.value } : p
-                    ))}
-                  />
-                </div>
-                {selectedPointData.type === 'shelf' && (
-                  <div className={styles.property}>
-                    <label className={styles.label}>SKU</label>
-                    <input 
-                      type="text" 
-                      className={styles.input}
-                      value={selectedPointData.sku || ''}
-                      onChange={(e) => setPoints(points.map(p => 
-                        p.id === selectedPoint ? { ...p, sku: e.target.value } : p
-                      ))}
-                    />
-                  </div>
-                )}
-                {selectedPointData.type === 'camera' && (
-                  <div className={styles.property}>
-                    <label className={styles.label}>Camera URL</label>
-                    <input 
-                      type="text" 
-                      className={styles.input}
-                      value={selectedPointData.cameraUrl || ''}
-                      onChange={(e) => setPoints(points.map(p => 
-                        p.id === selectedPoint ? { ...p, cameraUrl: e.target.value } : p
-                      ))}
-                    />
-                  </div>
-                )}
-                <button 
-                  className={styles.btnDanger}
-                  onClick={handleDeletePoint}
+      <div className={styles.layout}>
+        <section className={`card ${styles.canvasCard}`}>
+          <div className={styles.toolbar} role="toolbar" aria-label="Editor tools">
+            <div className="btn-group">
+              {TOOLS.map((t) => (
+                <button
+                  key={t.id}
+                  className={`btn btn-sm ${tool === t.id ? 'active' : ''}`}
+                  onClick={() => changeTool(t.id)}
+                  title={t.label}
+                  aria-pressed={tool === t.id}
                 >
-                  Delete Point
+                  <Icon name={t.icon} size={15} />
+                  <span className={styles.toolLabel}>{t.label}</span>
                 </button>
-              </div>
-            ) : (
-              <div className={styles.emptyState}>
-                Select a point to view properties
-              </div>
-            )}
-          </div>
-
-          <div className={styles.panel}>
-            <h3 className={styles.panelTitle}>Points of Interest</h3>
-            <div className={styles.pointsList}>
-              {points.map(point => (
-                <div 
-                  key={point.id}
-                  className={`${styles.pointItem} ${selectedPoint === point.id ? styles.pointItemActive : ''}`}
-                  onClick={() => setSelectedPoint(point.id)}
-                >
-                  <span className={styles.pointIcon}>{getPointIcon(point.type)}</span>
-                  <div className={styles.pointInfo}>
-                    <div className={styles.pointLabel}>{point.label}</div>
-                    <div className={styles.pointType}>{point.type}</div>
-                  </div>
-                </div>
               ))}
             </div>
+            <span className={styles.hint}>{hint}</span>
           </div>
-        </div>
-      </div>
 
-      {showAddDialog && (
-        <div className={styles.modal}>
-          <div className={styles.modalContent}>
-            <h2 className={styles.modalTitle}>
-              Add {mode === 'addShelf' ? 'Shelf' : 'Camera'}
-            </h2>
-            <div className={styles.formGroup}>
-              <label className={styles.label}>Label</label>
-              <input
-                type="text"
-                className={styles.input}
-                value={newPointData.label}
-                onChange={(e) => setNewPointData({ ...newPointData, label: e.target.value })}
-                placeholder="e.g., DAIRY-A1"
-              />
-            </div>
-            {mode === 'addShelf' && (
-              <div className={styles.formGroup}>
-                <label className={styles.label}>SKU</label>
-                <input
-                  type="text"
-                  className={styles.input}
-                  value={newPointData.sku}
-                  onChange={(e) => setNewPointData({ ...newPointData, sku: e.target.value })}
-                  placeholder="e.g., MILK-001"
-                />
-              </div>
-            )}
-            {mode === 'addCamera' && (
-              <div className={styles.formGroup}>
-                <label className={styles.label}>Camera URL</label>
-                <input
-                  type="text"
-                  className={styles.input}
-                  value={newPointData.cameraUrl}
-                  onChange={(e) => setNewPointData({ ...newPointData, cameraUrl: e.target.value })}
-                  placeholder="rtsp://camera-url"
-                />
-              </div>
-            )}
-            <div className={styles.modalActions}>
-              <button 
-                className={styles.btnSecondary}
-                onClick={() => {
-                  setShowAddDialog(false);
-                  setNewPointData({ label: '', sku: '', cameraUrl: '' });
-                  setMode('select');
-                }}
+          {plan.loading || shelves.loading ? (
+            <Loading />
+          ) : (
+            <div className={styles.canvasWrap}>
+              <svg
+                ref={svgRef}
+                viewBox={`0 0 ${W} ${H}`}
+                className={`${styles.canvas} ${tool !== 'select' ? styles.crosshair : ''}`}
+                onPointerDown={onCanvasPointerDown}
+                onPointerMove={onPointerMove}
+                onPointerUp={() => setDrag(null)}
+                onPointerLeave={() => setCursor(null)}
+                role="application"
+                aria-label="Store floor plan editor"
               >
-                Cancel
-              </button>
-              <button 
-                className={styles.btnPrimary}
-                onClick={handleAddPoint}
-                disabled={!newPointData.label}
-              >
-                Add
-              </button>
+                <defs>
+                  <pattern id="grid" width={GRID} height={GRID} patternUnits="userSpaceOnUse">
+                    <path d={`M ${GRID} 0 L 0 0 0 ${GRID}`} className={styles.gridLine} />
+                  </pattern>
+                </defs>
+                <rect width={W} height={H} fill="url(#grid)" />
+
+                {walls.map((w) => (
+                  <g key={w.id} onPointerDown={(e) => startDrag(e, { kind: 'wall', id: w.id }, { x: 0, y: 0 })}>
+                    <line x1={w.x1} y1={w.y1} x2={w.x2} y2={w.y2} className={styles.wallHit} />
+                    <line x1={w.x1} y1={w.y1} x2={w.x2} y2={w.y2} className={`${styles.wall} ${selectedWall?.id === w.id ? styles.selectedStroke : ''}`} />
+                  </g>
+                ))}
+
+                {wallStart && cursor && (
+                  <line x1={wallStart.x} y1={wallStart.y} x2={snap(cursor.x)} y2={snap(cursor.y)} className={styles.wallPreview} />
+                )}
+
+                {positioned.map(({ shelf, x, y }) => {
+                  const selected = selectedShelf?.id === shelf.id;
+                  return (
+                    <g
+                      key={shelf.id}
+                      transform={`translate(${x - SHELF_W / 2} ${y - SHELF_H / 2})`}
+                      className={`${styles.shelf} ${shelf.worstSeverity ? `sev-${shelf.worstSeverity}` : ''}`}
+                      onPointerDown={(e) => startDrag(e, { kind: 'shelf', label: shelf.label }, { x, y })}
+                    >
+                      <title>
+                        {shelf.label}
+                        {shelf.openAlerts ? ` — ${shelf.openAlerts} active alert(s)` : ''}
+                      </title>
+                      <rect
+                        width={SHELF_W}
+                        height={SHELF_H}
+                        rx={6}
+                        className={`${styles.shelfBody} ${shelf.worstSeverity ? styles.shelfAlert : ''} ${shelf.auditDue ? styles.shelfDue : ''} ${selected ? styles.selectedStroke : ''}`}
+                      />
+                      <text x={SHELF_W / 2} y={SHELF_H / 2 - 3} className={styles.shelfLabel}>
+                        {shelf.label}
+                      </text>
+                      <text x={SHELF_W / 2} y={SHELF_H / 2 + 11} className={styles.shelfSub}>
+                        {shelf.openAlerts ? `${shelf.openAlerts} alert${shelf.openAlerts === 1 ? '' : 's'}` : `${shelf.products.length} products`}
+                      </text>
+                    </g>
+                  );
+                })}
+
+                {points.map((p) => (
+                  <g
+                    key={p.id}
+                    transform={`translate(${p.x} ${p.y})`}
+                    className={styles.point}
+                    onPointerDown={(e) => startDrag(e, { kind: 'point', id: p.id }, { x: p.x, y: p.y })}
+                  >
+                    <title>{p.label}</title>
+                    <circle r={15} className={`${styles.pointBody} ${styles[`point-${p.type}`]} ${selectedPoint?.id === p.id ? styles.selectedStroke : ''}`} />
+                    <g transform="translate(-8 -8)" className={styles.pointIcon}>
+                      <Icon name={POINT_ICON[p.type]} size={16} />
+                    </g>
+                    <text y={29} className={styles.pointLabel}>
+                      {p.label}
+                    </text>
+                  </g>
+                ))}
+
+                {tool === 'place' && placing && cursor && (
+                  <rect
+                    x={snap(cursor.x) - SHELF_W / 2}
+                    y={snap(cursor.y) - SHELF_H / 2}
+                    width={SHELF_W}
+                    height={SHELF_H}
+                    rx={6}
+                    className={styles.ghost}
+                  />
+                )}
+              </svg>
             </div>
+          )}
+
+          <div className={styles.legend} aria-label="Legend">
+            <span>
+              <i className={styles.legendShelf} /> Shelf, no alerts
+            </span>
+            <span>
+              <i className={`${styles.legendShelf} ${styles.legendAlert}`} /> Active alert (darker = more severe)
+            </span>
+            <span>
+              <i className={`${styles.legendShelf} ${styles.legendDue}`} /> Audit due
+            </span>
           </div>
-        </div>
-      )}
+        </section>
+
+        <aside className={styles.side}>
+          <section className="card">
+            <div className="card-header">
+              <h2 className="card-title">Properties</h2>
+            </div>
+            <div className="card-body">
+              {selectedShelf ? (
+                <ShelfProperties shelf={selectedShelf} />
+              ) : selectedPoint ? (
+                <div className={styles.props}>
+                  <div className="field">
+                    <span className="field-label">Type</span>
+                    <span>{POINT_LABEL[selectedPoint.type]}</span>
+                  </div>
+                  <label className="field">
+                    <span className="field-label">Label</span>
+                    <input
+                      className="input"
+                      value={selectedPoint.label}
+                      onChange={(e) => {
+                        setPoints((ps) => ps.map((p) => (p.id === selectedPoint.id ? { ...p, label: e.target.value } : p)));
+                        setDirty(true);
+                      }}
+                    />
+                  </label>
+                  {selectedPoint.type === 'camera' && (
+                    <label className="field">
+                      <span className="field-label">Stream URL</span>
+                      <input
+                        className="input mono"
+                        value={selectedPoint.cameraUrl ?? ''}
+                        placeholder="rtsp://…"
+                        onChange={(e) => {
+                          setPoints((ps) => ps.map((p) => (p.id === selectedPoint.id ? { ...p, cameraUrl: e.target.value || undefined } : p)));
+                          setDirty(true);
+                        }}
+                      />
+                    </label>
+                  )}
+                  <button className="btn btn-danger" onClick={deleteSelection}>
+                    <Icon name="trash" size={15} /> Remove marker
+                  </button>
+                </div>
+              ) : selectedWall ? (
+                <div className={styles.props}>
+                  <span className="muted num">
+                    Wall ({selectedWall.x1}, {selectedWall.y1}) → ({selectedWall.x2}, {selectedWall.y2})
+                  </span>
+                  <button className="btn btn-danger" onClick={deleteSelection}>
+                    <Icon name="trash" size={15} /> Remove wall
+                  </button>
+                </div>
+              ) : (
+                <EmptyState icon="pointer" title="Nothing selected">
+                  Click a shelf, marker or wall.
+                </EmptyState>
+              )}
+            </div>
+          </section>
+
+          <section className="card">
+            <div className="card-header">
+              <h2 className="card-title">Unplaced shelves</h2>
+              <span className="muted num">{unplaced.length}</span>
+            </div>
+            {unplaced.length === 0 ? (
+              <div className="card-body muted">Every shelf is on the plan.</div>
+            ) : (
+              <ul className={styles.unplaced}>
+                {unplaced.map((s) => (
+                  <li key={s.id}>
+                    <button
+                      className={`list-item ${placing === s.label ? 'selected' : ''}`}
+                      onClick={() => {
+                        setPlacing(s.label);
+                        setTool('place');
+                        setWallStart(null);
+                      }}
+                    >
+                      <span className="mono">{s.label}</span> <span className="muted">{s.zone}</span>
+                      <span className={styles.placeHint}>Place →</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </aside>
+      </div>
     </div>
   );
 };
+
+const ShelfProperties = ({ shelf }: { shelf: Shelf }) => (
+  <div className={styles.props}>
+    <div className={styles.shelfHead}>
+      <div>
+        <div className="mono" style={{ fontWeight: 600 }}>
+          {shelf.label}
+        </div>
+        <div className="muted">
+          {shelf.zone ?? 'No zone'} · scanned {timeAgo(shelf.lastScanned)}
+        </div>
+      </div>
+      {shelf.worstSeverity && <SeverityBadge severity={shelf.worstSeverity} />}
+    </div>
+    {shelf.products.length === 0 ? (
+      <span className="muted">No products assigned.</span>
+    ) : (
+      <ul className={styles.productList}>
+        {shelf.products.map((p) => {
+          const status = p.stock === 0 ? 'OUT' : p.stock <= p.minThreshold ? 'LOW' : p.stock > p.maxCapacity ? 'OVER' : 'OK';
+          return (
+            <li key={p.id}>
+              <Link to={`/inventory?sku=${encodeURIComponent(p.sku)}`} className={styles.productRow}>
+                <span>{p.name}</span>
+                <span className="num muted">
+                  {p.stock}/{p.maxCapacity}
+                </span>
+              </Link>
+              <StockMeter stock={p.stock} max={p.maxCapacity} status={status} />
+            </li>
+          );
+        })}
+      </ul>
+    )}
+    <div className={styles.propActions}>
+      <Link className="btn btn-sm" to={`/vision-ai?shelf=${encodeURIComponent(shelf.label)}`}>
+        <Icon name="scan" size={14} /> Audit shelf
+      </Link>
+      {shelf.openAlerts > 0 && (
+        <Link className="btn btn-sm" to="/alerts">
+          <Icon name="bell" size={14} /> {shelf.openAlerts} alert{shelf.openAlerts === 1 ? '' : 's'}
+        </Link>
+      )}
+    </div>
+  </div>
+);
 
 export default FloorPlan;

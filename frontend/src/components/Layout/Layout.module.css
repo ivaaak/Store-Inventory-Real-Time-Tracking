@@ -5,87 +5,204 @@
 }
 
 .sidebar {
-  width: 260px;
+  width: var(--sidebar-width);
   background-color: var(--color-bg);
   border-right: 1px solid var(--color-border);
   display: flex;
   flex-direction: column;
   position: fixed;
-  height: 100vh;
-  left: 0;
-  top: 0;
+  inset: 0 auto 0 0;
   z-index: 100;
+  transition: transform 0.2s ease;
 }
 
 .logo {
-  padding: var(--spacing-lg);
-  border-bottom: 1px solid var(--color-border);
+  padding: 20px var(--spacing-md);
   display: flex;
   align-items: center;
-  gap: var(--spacing-md);
+  gap: 10px;
 }
 
-.logoIcon {
-  font-size: 32px;
+.logoMark {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+  flex-shrink: 0;
 }
 
 .logoText {
-  font-size: 20px;
+  font-size: 15px;
   font-weight: 700;
-  color: var(--color-text);
+  letter-spacing: -0.01em;
+}
+
+.logoSub {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
 }
 
 .nav {
   flex: 1;
-  padding: var(--spacing-lg) 0;
+  padding: var(--spacing-sm);
   display: flex;
   flex-direction: column;
-  gap: var(--spacing-xs);
+  gap: 2px;
 }
 
 .navLink {
   display: flex;
   align-items: center;
-  gap: var(--spacing-md);
-  padding: var(--spacing-md) var(--spacing-lg);
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: var(--border-radius-sm);
   color: var(--color-text-secondary);
-  text-decoration: none;
   font-weight: 500;
-  transition: all 0.2s ease;
-  position: relative;
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
 
 .navLink:hover {
   background-color: var(--color-bg-tertiary);
   color: var(--color-text);
+  text-decoration: none;
 }
 
-.navLinkActive {
+.navLinkActive,
+.navLinkActive:hover {
   color: var(--color-primary);
-  background-color: rgba(37, 99, 235, 0.1);
+  background-color: var(--color-primary-soft);
 }
 
-.navLinkActive::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 4px;
-  background-color: var(--color-primary);
-}
-
-.navIcon {
-  font-size: 20px;
-  width: 24px;
-  display: flex;
+.navCount {
+  margin-left: auto;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--color-danger);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-theme='dark'] .navCount {
+  color: #1a0b09;
+}
+
+.sidebarFooter {
+  padding: var(--spacing-md);
+  border-top: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.connectionRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  padding: 0 4px;
+}
+
+.connection {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--color-text-tertiary);
+}
+
+.live {
+  background: var(--color-success);
+  box-shadow: 0 0 0 3px var(--color-success-soft);
+}
+
+.connecting {
+  background: var(--color-warning);
+}
+
+.offline {
+  background: var(--color-danger);
+}
+
+.themeToggleBtn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background-color: var(--color-bg-tertiary);
+  border-radius: var(--border-radius-sm);
+  font-weight: 500;
+  font-size: 13px;
+  transition: background-color 0.15s ease;
+}
+
+.themeToggleBtn:hover {
+  background-color: var(--color-border);
 }
 
 .main {
   flex: 1;
-  margin-left: 260px;
+  margin-left: var(--sidebar-width);
   min-height: 100vh;
-  background-color: var(--color-bg-secondary);
+  min-width: 0;
+}
+
+/* Mobile: top bar + off-canvas sidebar */
+.topbar,
+.scrim {
+  display: none;
+}
+
+@media (max-width: 860px) {
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    position: fixed;
+    inset: 0 0 auto 0;
+    height: 52px;
+    padding: 0 var(--spacing-sm);
+    background: var(--color-bg);
+    border-bottom: 1px solid var(--color-border);
+    z-index: 90;
+  }
+
+  .topbar .connection {
+    margin-left: auto;
+    margin-right: var(--spacing-sm);
+  }
+
+  .sidebar {
+    transform: translateX(-100%);
+    box-shadow: var(--shadow-lg);
+  }
+
+  .sidebarOpen {
+    transform: none;
+  }
+
+  .scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgb(10 12 16 / 0.45);
+    z-index: 95;
+  }
+
+  .main {
+    margin-left: 0;
+    padding-top: 52px;
+  }
 }

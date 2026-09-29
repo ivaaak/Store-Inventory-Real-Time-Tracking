@@ -1,332 +1,360 @@
-import { useState, useRef } from 'react';
+import { DragEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { api, ApiError, assetUrl } from '../../api/client';
+import type { AuditLog } from '../../api/types';
+import { useQuery } from '../../hooks/useQuery';
+import { useToast } from '../../context/ToastContext';
+import { alertTypeLabel, formatDateTime, formatPercent, timeAgo } from '../../lib/format';
+import { EmptyState, ErrorState, Icon, Loading } from '../../components/ui';
 import styles from './VisionAI.module.css';
 
-interface AuditResult {
-  id: string;
-  timestamp: string;
+/** One audit run = one image of one shelf, covering several products. */
+interface AuditRun {
+  key: string;
   shelfLabel: string;
-  visualCount: number;
-  systemCount: number;
-  confidence: number;
-  status: 'match' | 'discrepancy' | 'phantom';
-  imageUrl: string;
-  aiResponse: string;
+  createdAt: string;
+  imageUrl: string | null;
+  failed: boolean;
+  items: AuditLog[];
+  alerts: number;
+  avgConfidence: number;
+  rawOutput: string | null;
 }
 
-const VisionAI = () => {
-  const [selectedImage, setSelectedImage] = useState<File | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string>('');
-  const [shelfLabel, setShelfLabel] = useState('');
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [results, setResults] = useState<AuditResult[]>([
-    {
-      id: '1',
-      timestamp: new Date(Date.now() - 3600000).toISOString(),
-      shelfLabel: 'DAIRY-A1',
-      visualCount: 0,
-      systemCount: 12,
-      confidence: 0.95,
-      status: 'phantom',
-      imageUrl: 'https://via.placeholder.com/400x300?text=Shelf+Image',
-      aiResponse: 'Visual inspection shows empty shelf. System indicates 12 units of MILK-001 should be present. This is a phantom stock situation.'
-    },
-    {
-      id: '2',
-      timestamp: new Date(Date.now() - 7200000).toISOString(),
-      shelfLabel: 'DAIRY-A2',
-      visualCount: 8,
-      systemCount: 8,
-      confidence: 0.92,
-      status: 'match',
-      imageUrl: 'https://via.placeholder.com/400x300?text=Shelf+Image',
-      aiResponse: 'Visual count matches system records. 8 units of CHEESE-001 detected on shelf.'
+const groupRuns = (logs: AuditLog[]): AuditRun[] => {
+  const runs = new Map<string, AuditRun>();
+  for (const log of logs) {
+    const shelfLabel = log.shelf?.label ?? '?';
+    // Uploaded audits share an image; seeded/legacy rows fall back to the minute.
+    const key = `${shelfLabel}|${log.imageUrl ?? log.createdAt.slice(0, 16)}`;
+    let run = runs.get(key);
+    if (!run) {
+      run = { key, shelfLabel, createdAt: log.createdAt, imageUrl: log.imageUrl, failed: false, items: [], alerts: 0, avgConfidence: 0, rawOutput: log.rawAiOutput };
+      runs.set(key, run);
     }
-  ]);
-  const [selectedAudit, setSelectedAudit] = useState<AuditResult | null>(null);
+    run.items.push(log);
+    if (log.status === 'FAILED') run.failed = true;
+    if (log.alertType) run.alerts++;
+  }
+  for (const run of runs.values()) {
+    run.avgConfidence = run.items.reduce((s, i) => s + i.confidence, 0) / run.items.length;
+  }
+  return [...runs.values()];
+};
+
+const runKeyForResult = (shelfLabel: string, imageUrl: string) => `${shelfLabel}|${imageUrl}`;
+
+const VisionAI = () => {
+  const [params] = useSearchParams();
+  const notify = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      setSelectedImage(file);
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setPreviewUrl(reader.result as string);
-      };
-      reader.readAsDataURL(file);
+  const [file, setFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState('');
+  const [shelfLabel, setShelfLabel] = useState(params.get('shelf') ?? '');
+  const [force, setForce] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+
+  const status = useQuery(() => api.visionStatus().then((r) => r.data), []);
+  const shelves = useQuery(() => api.shelves().then((r) => r.data), [], { liveOn: ['shelf.changed', 'audit.completed'] });
+  const audits = useQuery(() => api.recentAudits(200).then((r) => r.data), [], { liveOn: ['audit.completed'] });
+
+  const runs = useMemo(() => groupRuns(audits.data ?? []), [audits.data]);
+  const selectedRun = runs.find((r) => r.key === selectedKey) ?? null;
+  const shelf = shelves.data?.find((s) => s.label === shelfLabel);
+
+  // Object URLs must be released or they leak for the life of the tab.
+  useEffect(() => () => {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+  }, [previewUrl]);
+
+  const pickFile = (f: File | undefined) => {
+    if (!f) return;
+    if (!f.type.startsWith('image/')) {
+      setError('Please choose an image file (JPG, PNG or WebP).');
+      return;
+    }
+    if (f.size > 10 * 1024 * 1024) {
+      setError('Image is larger than 10 MB.');
+      return;
+    }
+    setError(null);
+    setFile(f);
+    setPreviewUrl(URL.createObjectURL(f));
+  };
+
+  const clearFile = () => {
+    setFile(null);
+    setPreviewUrl('');
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const onDrop = (e: DragEvent) => {
+    e.preventDefault();
+    setDragging(false);
+    pickFile(e.dataTransfer.files[0]);
+  };
+
+  const analyze = async () => {
+    if (!file || !shelfLabel) return;
+    setAnalyzing(true);
+    setError(null);
+    const form = new FormData();
+    form.append('image', file);
+    form.append('shelfLabel', shelfLabel);
+    form.append('force', String(force));
+    try {
+      const result = await api.performAudit(form);
+      notify({
+        kind: result.metadata.alertsRaised ? 'alert' : 'success',
+        title: `Audit of ${result.shelfLabel} complete`,
+        message: result.metadata.alertsRaised ? `${result.metadata.alertsRaised} issue(s) flagged` : 'Shelf matches the book',
+      });
+      clearFile();
+      setForce(false);
+      await audits.refetch();
+      setSelectedKey(runKeyForResult(result.shelfLabel, result.imageUrl));
+    } catch (err) {
+      setError(err instanceof ApiError && err.status === 429 ? `${err.message} Tick “Audit anyway” to override.` : (err as Error).message);
+    } finally {
+      setAnalyzing(false);
     }
   };
 
-  const handleAnalyze = async () => {
-    if (!selectedImage || !shelfLabel) return;
-
-    setIsAnalyzing(true);
-    
-    // Simulate API call
-    setTimeout(() => {
-      const newResult: AuditResult = {
-        id: `${Date.now()}`,
-        timestamp: new Date().toISOString(),
-        shelfLabel: shelfLabel,
-        visualCount: Math.floor(Math.random() * 15),
-        systemCount: Math.floor(Math.random() * 15),
-        confidence: 0.85 + Math.random() * 0.15,
-        status: Math.random() > 0.5 ? 'match' : 'discrepancy',
-        imageUrl: previewUrl,
-        aiResponse: 'Analysis complete. Visual inspection shows varying stock levels.'
-      };
-
-      setResults([newResult, ...results]);
-      setIsAnalyzing(false);
-      setSelectedImage(null);
-      setPreviewUrl('');
-      setShelfLabel('');
-    }, 3000);
-  };
-
-  const getStatusBadge = (status: string) => {
-    switch (status) {
-      case 'match':
-        return <span className={styles.badgeSuccess}>Match</span>;
-      case 'discrepancy':
-        return <span className={styles.badgeWarning}>Discrepancy</span>;
-      case 'phantom':
-        return <span className={styles.badgeDanger}>Phantom Stock</span>;
-      default:
-        return <span className={styles.badge}>Unknown</span>;
-    }
-  };
-
-  const formatTimestamp = (timestamp: string) => {
-    const date = new Date(timestamp);
-    return date.toLocaleString();
-  };
+  const disabled = status.data && !status.data.enabled;
 
   return (
-    <div className={styles.container}>
-      <div className={styles.header}>
-        <h1 className={styles.title}>Vision AI Auditing</h1>
-        <div className={styles.stats}>
-          <div className={styles.statCard}>
-            <div className={styles.statValue}>{results.length}</div>
-            <div className={styles.statLabel}>Total Audits</div>
-          </div>
-          <div className={styles.statCard}>
-            <div className={styles.statValue}>
-              {results.filter(r => r.status === 'phantom').length}
-            </div>
-            <div className={styles.statLabel}>Phantom Stock</div>
-          </div>
-          <div className={styles.statCard}>
-            <div className={styles.statValue}>
-              {(results.reduce((acc, r) => acc + r.confidence, 0) / results.length * 100).toFixed(0)}%
-            </div>
-            <div className={styles.statLabel}>Avg Confidence</div>
-          </div>
+    <div className="page">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">Vision AI audits</h1>
+          <div className="page-subtitle">Compare what the camera sees with what the book says</div>
         </div>
+        {status.data?.provider && (
+          <span className={`badge ${status.data.provider === 'mock' ? 'badge-warning' : 'badge-success'} badge-dot`}>
+            {status.data.provider === 'mock' ? 'Mock provider (development)' : 'OpenAI vision'}
+          </span>
+        )}
       </div>
 
-      <div className={styles.content}>
-        <div className={styles.mainPanel}>
-          <div className={styles.uploadSection}>
-            <h2 className={styles.sectionTitle}>New Audit</h2>
-            
-            <div className={styles.uploadArea}>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                onChange={handleFileSelect}
-                className={styles.fileInput}
-              />
-              
-              {previewUrl ? (
-                <div className={styles.preview}>
-                  <img src={previewUrl} alt="Preview" className={styles.previewImage} />
-                  <button 
-                    className={styles.removeBtn}
-                    onClick={() => {
-                      setSelectedImage(null);
-                      setPreviewUrl('');
-                      if (fileInputRef.current) fileInputRef.current.value = '';
-                    }}
-                  >
-                    ✕
-                  </button>
-                </div>
-              ) : (
-                <div 
-                  className={styles.dropzone}
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  <div className={styles.dropzoneIcon}>📷</div>
-                  <div className={styles.dropzoneText}>
-                    Click to upload shelf image
-                  </div>
-                  <div className={styles.dropzoneSubtext}>
-                    JPG, PNG or WebP (max 10MB)
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className={styles.formGroup}>
-              <label className={styles.label}>Shelf Label</label>
-              <input
-                type="text"
-                className={styles.input}
-                value={shelfLabel}
-                onChange={(e) => setShelfLabel(e.target.value)}
-                placeholder="e.g., DAIRY-A1"
-              />
-            </div>
-
-            <button
-              className={styles.btnPrimary}
-              onClick={handleAnalyze}
-              disabled={!selectedImage || !shelfLabel || isAnalyzing}
-            >
-              {isAnalyzing ? (
-                <>
-                  <span className={styles.spinner}></span>
-                  Analyzing...
-                </>
-              ) : (
-                '🔍 Analyze Shelf'
-              )}
-            </button>
+      {disabled && (
+        <div className={`card ${styles.banner}`} role="status">
+          <Icon name="alert" />
+          <div>
+            <strong>Vision AI is not configured.</strong> Set <code>OPENAI_API_KEY</code> on the API server, or{' '}
+            <code>VISION_PROVIDER=mock</code> for local development. Audit history is still available below.
           </div>
+        </div>
+      )}
 
-          <div className={styles.resultsSection}>
-            <h2 className={styles.sectionTitle}>Audit History</h2>
-            
-            <div className={styles.resultsList}>
-              {results.map((result) => (
+      <div className="split">
+        <div className={styles.mainCol}>
+          <section className="card" aria-label="New audit">
+            <div className="card-header">
+              <h2 className="card-title">New audit</h2>
+            </div>
+            <div className={`card-body ${styles.form}`}>
+              <div className={styles.formRow}>
+                <label className="field">
+                  <span className="field-label">Shelf</span>
+                  <select className="select" value={shelfLabel} onChange={(e) => setShelfLabel(e.target.value)}>
+                    <option value="">Choose a shelf…</option>
+                    {shelves.data?.map((s) => (
+                      <option key={s.id} value={s.label}>
+                        {s.label}
+                        {s.zone ? ` — ${s.zone}` : ''}
+                        {s.auditDue ? ' (due)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                  {shelf && (
+                    <span className="field-hint">
+                      {shelf.products.length} product{shelf.products.length === 1 ? '' : 's'} expected · last scanned {timeAgo(shelf.lastScanned)}
+                    </span>
+                  )}
+                </label>
+
                 <div
-                  key={result.id}
-                  className={`${styles.resultCard} ${selectedAudit?.id === result.id ? styles.resultCardActive : ''}`}
-                  onClick={() => setSelectedAudit(result)}
+                  className={`${styles.dropzone} ${dragging ? styles.dropzoneActive : ''} ${previewUrl ? styles.dropzoneFilled : ''}`}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setDragging(true);
+                  }}
+                  onDragLeave={() => setDragging(false)}
+                  onDrop={onDrop}
                 >
-                  <img 
-                    src={result.imageUrl} 
-                    alt={result.shelfLabel}
-                    className={styles.resultImage}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    className="sr-only"
+                    id="shelf-image"
+                    onChange={(e) => pickFile(e.target.files?.[0])}
                   />
-                  <div className={styles.resultContent}>
-                    <div className={styles.resultHeader}>
-                      <h3 className={styles.resultTitle}>{result.shelfLabel}</h3>
-                      {getStatusBadge(result.status)}
-                    </div>
-                    <div className={styles.resultMeta}>
-                      <div className={styles.resultTime}>
-                        {formatTimestamp(result.timestamp)}
-                      </div>
-                      <div className={styles.resultConfidence}>
-                        Confidence: {(result.confidence * 100).toFixed(0)}%
-                      </div>
-                    </div>
-                    <div className={styles.resultCounts}>
-                      <div className={styles.count}>
-                        <span className={styles.countLabel}>Visual:</span>
-                        <span className={styles.countValue}>{result.visualCount}</span>
-                      </div>
-                      <div className={styles.count}>
-                        <span className={styles.countLabel}>System:</span>
-                        <span className={styles.countValue}>{result.systemCount}</span>
-                      </div>
-                    </div>
-                  </div>
+                  {previewUrl ? (
+                    <>
+                      <img src={previewUrl} alt="Selected shelf" className={styles.preview} />
+                      <button type="button" className={`btn btn-sm ${styles.removeBtn}`} onClick={clearFile}>
+                        <Icon name="x" size={14} /> Remove
+                      </button>
+                    </>
+                  ) : (
+                    <label htmlFor="shelf-image" className={styles.dropzoneLabel}>
+                      <Icon name="upload" size={22} />
+                      <span>
+                        <strong>Drop a shelf photo</strong> or click to browse
+                      </span>
+                      <span className="muted">JPG, PNG or WebP · max 10 MB</span>
+                    </label>
+                  )}
                 </div>
-              ))}
+              </div>
+
+              {shelf && shelf.products.length > 0 && (
+                <div className={styles.expected}>
+                  {shelf.products.map((p) => (
+                    <span key={p.id} className="badge">
+                      {p.name} <span className="num muted">· {p.stock}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {error && <div className="form-error">{error}</div>}
+
+              <div className={styles.submitRow}>
+                <label className="checkbox">
+                  <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
+                  Audit anyway if scanned recently
+                </label>
+                <button className="btn btn-primary" onClick={analyze} disabled={!file || !shelfLabel || analyzing || !!disabled}>
+                  {analyzing ? (
+                    <>
+                      <span className="spinner" /> Analyzing…
+                    </>
+                  ) : (
+                    <>
+                      <Icon name="scan" size={15} /> Analyze shelf
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
-          </div>
+          </section>
+
+          <section className="card" aria-label="Audit history">
+            <div className="card-header">
+              <h2 className="card-title">Audit history</h2>
+              <span className="muted">{runs.length} runs</span>
+            </div>
+            {audits.loading ? (
+              <Loading />
+            ) : audits.error ? (
+              <ErrorState error={audits.error} onRetry={audits.refetch} />
+            ) : runs.length === 0 ? (
+              <EmptyState icon="eye" title="No audits yet">
+                Upload a shelf photo to run the first one.
+              </EmptyState>
+            ) : (
+              <ul className={styles.runs}>
+                {runs.map((run) => (
+                  <li key={run.key}>
+                    <button className={`list-item ${styles.run} ${selectedKey === run.key ? 'selected' : ''}`} onClick={() => setSelectedKey(run.key)}>
+                      <div className={styles.thumb}>
+                        {run.imageUrl ? <img src={assetUrl(run.imageUrl)} alt="" loading="lazy" /> : <Icon name="image" size={18} />}
+                      </div>
+                      <div className={styles.runMain}>
+                        <div className={styles.runTitle}>
+                          <span className="mono">{run.shelfLabel}</span>
+                          {run.failed ? (
+                            <span className="badge badge-danger">Failed</span>
+                          ) : run.alerts ? (
+                            <span className="badge badge-warning">
+                              {run.alerts} issue{run.alerts === 1 ? '' : 's'}
+                            </span>
+                          ) : (
+                            <span className="badge badge-success">Matches book</span>
+                          )}
+                        </div>
+                        <div className={styles.runMeta}>
+                          {run.items.length} product{run.items.length === 1 ? '' : 's'} · confidence {formatPercent(run.avgConfidence)}
+                        </div>
+                      </div>
+                      <span className={styles.runTime}>{timeAgo(run.createdAt)}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
         </div>
 
-        <div className={styles.detailPanel}>
-          {selectedAudit ? (
-            <>
-              <div className={styles.detailHeader}>
-                <h2 className={styles.detailTitle}>Audit Details</h2>
-                {getStatusBadge(selectedAudit.status)}
-              </div>
-
-              <div className={styles.detailImage}>
-                <img 
-                  src={selectedAudit.imageUrl} 
-                  alt={selectedAudit.shelfLabel}
-                />
-              </div>
-
-              <div className={styles.detailSection}>
-                <h3 className={styles.detailSectionTitle}>Shelf Information</h3>
-                <div className={styles.detailGrid}>
-                  <div className={styles.detailItem}>
-                    <div className={styles.detailLabel}>Shelf Label</div>
-                    <div className={styles.detailValue}>{selectedAudit.shelfLabel}</div>
-                  </div>
-                  <div className={styles.detailItem}>
-                    <div className={styles.detailLabel}>Timestamp</div>
-                    <div className={styles.detailValue}>
-                      {formatTimestamp(selectedAudit.timestamp)}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div className={styles.detailSection}>
-                <h3 className={styles.detailSectionTitle}>Stock Analysis</h3>
-                <div className={styles.detailGrid}>
-                  <div className={styles.detailItem}>
-                    <div className={styles.detailLabel}>Visual Count</div>
-                    <div className={styles.detailValue}>{selectedAudit.visualCount}</div>
-                  </div>
-                  <div className={styles.detailItem}>
-                    <div className={styles.detailLabel}>System Count</div>
-                    <div className={styles.detailValue}>{selectedAudit.systemCount}</div>
-                  </div>
-                  <div className={styles.detailItem}>
-                    <div className={styles.detailLabel}>Discrepancy</div>
-                    <div className={styles.detailValue}>
-                      {Math.abs(selectedAudit.visualCount - selectedAudit.systemCount)}
-                    </div>
-                  </div>
-                  <div className={styles.detailItem}>
-                    <div className={styles.detailLabel}>Confidence</div>
-                    <div className={styles.detailValue}>
-                      {(selectedAudit.confidence * 100).toFixed(0)}%
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div className={styles.detailSection}>
-                <h3 className={styles.detailSectionTitle}>AI Response</h3>
-                <div className={styles.aiResponse}>
-                  {selectedAudit.aiResponse}
-                </div>
-              </div>
-
-              <div className={styles.detailActions}>
-                <button className={styles.btnSecondary}>
-                  Create Alert
-                </button>
-                <button className={styles.btnSecondary}>
-                  Download Report
-                </button>
-              </div>
-            </>
+        <aside className="card detail" aria-label="Audit details">
+          {selectedRun ? (
+            <RunDetail run={selectedRun} />
           ) : (
-            <div className={styles.emptyState}>
-              <div className={styles.emptyIcon}>👁️</div>
-              <div className={styles.emptyText}>
-                Select an audit to view details
-              </div>
-            </div>
+            <EmptyState icon="eye" title="No audit selected">
+              Pick an audit run to compare visual and system counts.
+            </EmptyState>
           )}
-        </div>
+        </aside>
       </div>
     </div>
   );
 };
+
+const RunDetail = ({ run }: { run: AuditRun }) => (
+  <>
+    <div className="card-header">
+      <div>
+        <h2 className="card-title">
+          Audit · <span className="mono">{run.shelfLabel}</span>
+        </h2>
+        <div className="muted">{formatDateTime(run.createdAt)}</div>
+      </div>
+    </div>
+    {run.imageUrl && (
+      <a href={assetUrl(run.imageUrl)} target="_blank" rel="noreferrer" className={styles.detailImage}>
+        <img src={assetUrl(run.imageUrl)} alt={`Shelf ${run.shelfLabel}`} />
+      </a>
+    )}
+    <div className="table-wrap">
+      <table className="table">
+        <thead>
+          <tr>
+            <th>Product</th>
+            <th className="right">System</th>
+            <th className="right">Visual</th>
+            <th className="right">Conf.</th>
+          </tr>
+        </thead>
+        <tbody>
+          {run.items.map((i) => (
+            <tr key={i.id}>
+              <td>
+                <div>{i.product.name}</div>
+                {i.alertType && <span className="badge badge-warning">{alertTypeLabel(i.alertType)}</span>}
+              </td>
+              <td className="right num">{i.systemCount}</td>
+              <td className={`right num ${i.discrepancy !== 0 && i.status !== 'FAILED' ? styles.mismatch : ''}`}>
+                {i.status === 'FAILED' ? '—' : i.visualCount}
+              </td>
+              <td className="right num">{formatPercent(i.confidence)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+    {run.rawOutput && (
+      <details className={styles.raw}>
+        <summary>Raw model output</summary>
+        <pre>{run.rawOutput}</pre>
+      </details>
+    )}
+  </>
+);
 
 export default VisionAI;

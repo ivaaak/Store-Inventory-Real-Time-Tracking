@@ -1,312 +1,375 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { api } from '../../api/client';
+import type { Product, StockStatus } from '../../api/types';
+import { useQuery } from '../../hooks/useQuery';
+import { useToast } from '../../context/ToastContext';
+import { formatDateTime, formatPercent, timeAgo } from '../../lib/format';
+import { EmptyState, ErrorState, Icon, Loading, Modal, StatCard, StockBadge, StockMeter, stockColor } from '../../components/ui';
 import styles from './Inventory.module.css';
 
-interface Product {
-  id: string;
-  sku: string;
-  name: string;
-  shelf: string;
-  currentStock: number;
-  minThreshold: number;
-  maxCapacity: number;
-  lastAudit: string;
-  status: 'ok' | 'low' | 'critical';
-}
+type Filter = 'ALL' | StockStatus;
+
+const FILTERS: Array<[Filter, string]> = [
+  ['ALL', 'All'],
+  ['OUT', 'Out'],
+  ['LOW', 'Low'],
+  ['OK', 'In stock'],
+  ['OVER', 'Over'],
+];
+
+type StockAction = 'add' | 'sale';
 
 const Inventory = () => {
-  const [searchQuery, setSearchQuery] = useState('');
-  const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
+  const [params, setParams] = useSearchParams();
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState<Filter>('ALL');
+  const [action, setAction] = useState<StockAction | null>(null);
+  const selectedSku = params.get('sku');
 
-  const products: Product[] = [
-    {
-      id: '1',
-      sku: 'MILK-001',
-      name: 'Whole Milk 1L',
-      shelf: 'DAIRY-A1',
-      currentStock: 0,
-      minThreshold: 5,
-      maxCapacity: 20,
-      lastAudit: new Date(Date.now() - 3600000).toISOString(),
-      status: 'critical'
-    },
-    {
-      id: '2',
-      sku: 'CHEESE-001',
-      name: 'Cheddar Cheese 250g',
-      shelf: 'DAIRY-A2',
-      currentStock: 8,
-      minThreshold: 5,
-      maxCapacity: 15,
-      lastAudit: new Date(Date.now() - 7200000).toISOString(),
-      status: 'ok'
-    },
-    {
-      id: '3',
-      sku: 'BREAD-001',
-      name: 'White Bread',
-      shelf: 'BAKERY-B1',
-      currentStock: 3,
-      minThreshold: 5,
-      maxCapacity: 25,
-      lastAudit: new Date(Date.now() - 10800000).toISOString(),
-      status: 'low'
-    },
-    {
-      id: '4',
-      sku: 'YOGURT-001',
-      name: 'Greek Yogurt 500g',
-      shelf: 'DAIRY-A3',
-      currentStock: 12,
-      minThreshold: 5,
-      maxCapacity: 20,
-      lastAudit: new Date(Date.now() - 14400000).toISOString(),
-      status: 'ok'
+  const products = useQuery(() => api.products().then((r) => r.data), [], {
+    liveOn: ['stock.changed', 'audit.completed', 'shelf.changed'],
+  });
+
+  const counts = useMemo(() => {
+    const c = { ALL: 0, OUT: 0, LOW: 0, OK: 0, OVER: 0 } as Record<Filter, number>;
+    for (const p of products.data ?? []) {
+      c.ALL++;
+      c[p.status]++;
     }
-  ];
+    return c;
+  }, [products.data]);
 
-  const filteredProducts = products.filter(product =>
-    product.sku.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    product.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    product.shelf.toLowerCase().includes(searchQuery.toLowerCase())
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return (products.data ?? []).filter(
+      (p) =>
+        (filter === 'ALL' || p.status === filter) &&
+        (!q || [p.sku, p.name, p.shelf?.label, p.category].some((f) => f?.toLowerCase().includes(q)))
+    );
+  }, [products.data, search, filter]);
+
+  const selected = products.data?.find((p) => p.sku === selectedSku) ?? null;
+
+  const select = (p: Product) =>
+    setParams(
+      (prev) => {
+        prev.set('sku', p.sku);
+        return prev;
+      },
+      { replace: true }
+    );
+
+  return (
+    <div className="page">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">Inventory</h1>
+          <div className="page-subtitle">Book stock per product, updated live from sales and restocks</div>
+        </div>
+        <label className="input-with-icon">
+          <Icon name="search" size={15} />
+          <input
+            className={`input ${styles.search}`}
+            placeholder="Search SKU, name, shelf…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            aria-label="Search products"
+          />
+        </label>
+      </div>
+
+      <section className={styles.stats} aria-label="Stock summary">
+        <StatCard label="Products" icon="package" value={counts.ALL} />
+        <StatCard label="In stock" value={counts.OK} tone="success" />
+        <StatCard label="Low stock" value={counts.LOW} tone={counts.LOW ? 'warning' : undefined} />
+        <StatCard label="Out of stock" value={counts.OUT} tone={counts.OUT ? 'danger' : undefined} />
+      </section>
+
+      <div className="split">
+        <section className="card" aria-label="Products">
+          <div className="card-header">
+            <div className="btn-group" role="tablist" aria-label="Stock status filter">
+              {FILTERS.map(([f, label]) => (
+                <button
+                  key={f}
+                  role="tab"
+                  aria-selected={filter === f}
+                  className={`btn btn-sm ${filter === f ? 'active' : ''}`}
+                  onClick={() => setFilter(f)}
+                >
+                  {label} <span className="muted num">{counts[f]}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          {products.loading ? (
+            <Loading />
+          ) : products.error ? (
+            <ErrorState error={products.error} onRetry={products.refetch} />
+          ) : filtered.length === 0 ? (
+            <EmptyState icon="search" title="No products match">
+              Try a different search or filter.
+            </EmptyState>
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Product</th>
+                    <th>Shelf</th>
+                    <th className={styles.stockCol}>Stock</th>
+                    <th>Status</th>
+                    <th className="right">Last audit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map((p) => (
+                    <tr
+                      key={p.id}
+                      className={`clickable ${selected?.id === p.id ? 'selected' : ''}`}
+                      onClick={() => select(p)}
+                      onKeyDown={(e) => e.key === 'Enter' && select(p)}
+                      tabIndex={0}
+                      aria-selected={selected?.id === p.id}
+                    >
+                      <td>
+                        <div className={styles.productName}>{p.name}</div>
+                        <div className="mono muted">{p.sku}</div>
+                      </td>
+                      <td className="mono">{p.shelf?.label ?? <span className="muted">—</span>}</td>
+                      <td className={styles.stockCol}>
+                        <div className={styles.stockCell}>
+                          <span className="num">
+                            {p.stock}
+                            <span className="muted">/{p.maxCapacity}</span>
+                          </span>
+                          <StockMeter stock={p.stock} max={p.maxCapacity} status={p.status} />
+                        </div>
+                      </td>
+                      <td>
+                        <StockBadge status={p.status} />
+                      </td>
+                      <td className="right muted">{p.lastAudit ? timeAgo(p.lastAudit.createdAt) : 'never'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+
+        <aside className="card detail" aria-label="Product details">
+          {selected ? (
+            <ProductDetail product={selected} onAction={setAction} />
+          ) : (
+            <EmptyState icon="package" title="No product selected">
+              Pick a product to see stock levels and act on it.
+            </EmptyState>
+          )}
+        </aside>
+      </div>
+
+      {action && selected && <StockModal product={selected} action={action} onClose={() => setAction(null)} />}
+    </div>
   );
+};
 
-  const getStockPercentage = (product: Product) => {
-    return (product.currentStock / product.maxCapacity) * 100;
-  };
+const RING_R = 58;
+const RING_C = 2 * Math.PI * RING_R;
 
-  const getStockColor = (product: Product) => {
-    const percentage = getStockPercentage(product);
-    if (percentage === 0) return 'var(--color-danger)';
-    if (percentage < 30) return 'var(--color-warning)';
-    return 'var(--color-success)';
-  };
+const ProductDetail = ({ product, onAction }: { product: Product; onAction: (a: StockAction) => void }) => {
+  const navigate = useNavigate();
+  const metrics = useQuery(() => api.productMetrics(product.sku, 30).then((r) => r.data), [product.sku], {
+    liveOn: ['stock.changed'],
+  });
+  const alerts = useQuery(
+    () => api.alerts({ statuses: 'OPEN,ACKNOWLEDGED,IN_PROGRESS', limit: 200 }).then((r) => r.data.filter((a) => a.productId === product.id)),
+    [product.id],
+    { liveOn: ['alert.created', 'alert.updated'] }
+  );
+  const fill = Math.min(1, product.maxCapacity ? product.stock / product.maxCapacity : 0);
 
-  const formatTimestamp = (timestamp: string) => {
-    const date = new Date(timestamp);
-    return date.toLocaleString();
-  };
+  return (
+    <>
+      <div className="card-header">
+        <div>
+          <h2 className="card-title">{product.name}</h2>
+          <div className="mono muted">{product.sku}</div>
+        </div>
+        <StockBadge status={product.status} />
+      </div>
+      <div className={`card-body ${styles.detailBody}`}>
+        <div className={styles.ringRow}>
+          <svg width="140" height="140" viewBox="0 0 140 140" role="img" aria-label={`${product.stock} of ${product.maxCapacity} units`}>
+            <circle cx="70" cy="70" r={RING_R} fill="none" stroke="var(--color-bg-tertiary)" strokeWidth="12" />
+            <circle
+              cx="70"
+              cy="70"
+              r={RING_R}
+              fill="none"
+              stroke={stockColor(product.status)}
+              strokeWidth="12"
+              strokeLinecap="round"
+              strokeDasharray={RING_C}
+              strokeDashoffset={RING_C * (1 - fill)}
+              transform="rotate(-90 70 70)"
+              style={{ transition: 'stroke-dashoffset 0.4s ease' }}
+            />
+            <text x="70" y="68" textAnchor="middle" className={styles.ringValue}>
+              {product.stock}
+            </text>
+            <text x="70" y="88" textAnchor="middle" className={styles.ringLabel}>
+              of {product.maxCapacity}
+            </text>
+          </svg>
+          <dl className={styles.ringStats}>
+            <div>
+              <dt>Min. threshold</dt>
+              <dd className="num">{product.minThreshold}</dd>
+            </div>
+            <div>
+              <dt>Sold / day (30d)</dt>
+              <dd className="num">{metrics.data ? metrics.data.averageDailySales : '…'}</dd>
+            </div>
+            <div>
+              <dt>Days of cover</dt>
+              <dd className="num">{metrics.data ? (metrics.data.daysOfCover ?? '—') : '…'}</dd>
+            </div>
+            <div>
+              <dt>Stock-outs (30d)</dt>
+              <dd className="num">{metrics.data ? metrics.data.stockouts : '…'}</dd>
+            </div>
+          </dl>
+        </div>
 
-  const getTimeAgo = (timestamp: string) => {
-    const diff = Date.now() - new Date(timestamp).getTime();
-    const minutes = Math.floor(diff / 60000);
-    if (minutes < 60) return `${minutes}m ago`;
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
-    const days = Math.floor(hours / 24);
-    return `${days}d ago`;
+        <dl className="kv">
+          <div>
+            <dt>Shelf</dt>
+            <dd className="mono">{product.shelf?.label ?? '—'}</dd>
+          </div>
+          <div>
+            <dt>Category</dt>
+            <dd>{product.category ?? '—'}</dd>
+          </div>
+          <div>
+            <dt>Unit price</dt>
+            <dd className="num">{Number(product.price).toFixed(2)}</dd>
+          </div>
+          <div>
+            <dt>Last audit</dt>
+            <dd>
+              {product.lastAudit
+                ? `${formatDateTime(product.lastAudit.createdAt)} · saw ${product.lastAudit.visualCount} (${formatPercent(product.lastAudit.confidence)})`
+                : 'Never audited'}
+            </dd>
+          </div>
+        </dl>
+
+        {!!alerts.data?.length && (
+          <div>
+            <h3 className="section-title">Active alerts</h3>
+            <ul className={styles.alertList}>
+              {alerts.data.map((a) => (
+                <li key={a.id}>
+                  <button className={styles.alertLink} onClick={() => navigate(`/alerts?id=${a.id}`)}>
+                    <span className={`badge badge-sev sev-${a.severity}`}>{a.severity.toLowerCase()}</span>
+                    <span>{a.message}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        <div className={styles.actions}>
+          <button className="btn btn-primary" onClick={() => onAction('add')}>
+            <Icon name="plus" size={15} /> Add stock
+          </button>
+          <button className="btn" onClick={() => onAction('sale')} disabled={product.stock === 0}>
+            <Icon name="cart" size={15} /> Record sale
+          </button>
+          <button
+            className="btn"
+            onClick={() => navigate(`/vision-ai?shelf=${encodeURIComponent(product.shelf?.label ?? '')}`)}
+            disabled={!product.shelf}
+          >
+            <Icon name="scan" size={15} /> Audit shelf
+          </button>
+        </div>
+      </div>
+    </>
+  );
+};
+
+const StockModal = ({ product, action, onClose }: { product: Product; action: StockAction; onClose: () => void }) => {
+  const notify = useToast();
+  const [quantity, setQuantity] = useState(action === 'add' ? Math.max(1, product.maxCapacity - product.stock) : 1);
+  const [shelfLabel, setShelfLabel] = useState(product.shelf?.label ?? '');
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const max = action === 'sale' ? product.stock : 10_000;
+  const valid = quantity >= 1 && quantity <= max && (action === 'sale' || shelfLabel.trim());
+  const after = action === 'add' ? product.stock + quantity : product.stock - quantity;
+
+  const submit = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      if (action === 'add') await api.addStock({ sku: product.sku, quantity, shelfLabel: shelfLabel.trim() });
+      else await api.recordSale({ sku: product.sku, quantity });
+      notify({ kind: 'success', title: action === 'add' ? 'Stock added' : 'Sale recorded', message: `${product.name}: ${after} units` });
+      onClose();
+    } catch (err) {
+      setError((err as Error).message);
+      setSaving(false);
+    }
   };
 
   return (
-    <div className={styles.container}>
-      <div className={styles.header}>
-        <h1 className={styles.title}>Inventory</h1>
-        <div className={styles.headerActions}>
-          <input
-            type="text"
-            className={styles.searchInput}
-            placeholder="Search by SKU, name, or shelf..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-          />
-        </div>
-      </div>
-
-      <div className={styles.stats}>
-        <div className={styles.statCard}>
-          <div className={styles.statValue}>{products.length}</div>
-          <div className={styles.statLabel}>Total Products</div>
-        </div>
-        <div className={styles.statCard}>
-          <div className={styles.statValue}>
-            {products.filter(p => p.status === 'ok').length}
-          </div>
-          <div className={styles.statLabel}>In Stock</div>
-        </div>
-        <div className={styles.statCard}>
-          <div className={styles.statValue}>
-            {products.filter(p => p.status === 'low').length}
-          </div>
-          <div className={styles.statLabel}>Low Stock</div>
-        </div>
-        <div className={styles.statCard}>
-          <div className={styles.statValue}>
-            {products.filter(p => p.status === 'critical').length}
-          </div>
-          <div className={styles.statLabel}>Out of Stock</div>
-        </div>
-      </div>
-
-      <div className={styles.content}>
-        <div className={styles.productsList}>
-          <div className={styles.tableHeader}>
-            <div className={styles.columnSku}>SKU</div>
-            <div className={styles.columnName}>Product Name</div>
-            <div className={styles.columnShelf}>Shelf</div>
-            <div className={styles.columnStock}>Stock</div>
-            <div className={styles.columnStatus}>Status</div>
-            <div className={styles.columnAudit}>Last Audit</div>
-          </div>
-
-          <div className={styles.tableBody}>
-            {filteredProducts.map(product => (
-              <div
-                key={product.id}
-                className={`${styles.productRow} ${selectedProduct?.id === product.id ? styles.productRowActive : ''}`}
-                onClick={() => setSelectedProduct(product)}
-              >
-                <div className={styles.columnSku}>
-                  <span className={styles.skuBadge}>{product.sku}</span>
-                </div>
-                <div className={styles.columnName}>{product.name}</div>
-                <div className={styles.columnShelf}>{product.shelf}</div>
-                <div className={styles.columnStock}>
-                  <div className={styles.stockInfo}>
-                    <span className={styles.stockValue}>
-                      {product.currentStock}/{product.maxCapacity}
-                    </span>
-                    <div className={styles.stockBar}>
-                      <div
-                        className={styles.stockBarFill}
-                        style={{
-                          width: `${getStockPercentage(product)}%`,
-                          backgroundColor: getStockColor(product)
-                        }}
-                      />
-                    </div>
-                  </div>
-                </div>
-                <div className={styles.columnStatus}>
-                  <span className={`${styles.statusBadge} ${styles[`status${product.status}`]}`}>
-                    {product.status}
-                  </span>
-                </div>
-                <div className={styles.columnAudit}>
-                  {getTimeAgo(product.lastAudit)}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className={styles.detailPanel}>
-          {selectedProduct ? (
-            <>
-              <div className={styles.detailHeader}>
-                <h2 className={styles.detailTitle}>Product Details</h2>
-                <span className={`${styles.statusBadge} ${styles[`status${selectedProduct.status}`]}`}>
-                  {selectedProduct.status}
-                </span>
-              </div>
-
-              <div className={styles.detailSection}>
-                <h3 className={styles.detailSectionTitle}>Basic Information</h3>
-                <div className={styles.detailGrid}>
-                  <div className={styles.detailItem}>
-                    <div className={styles.detailLabel}>SKU</div>
-                    <div className={styles.detailValue}>{selectedProduct.sku}</div>
-                  </div>
-                  <div className={styles.detailItem}>
-                    <div className={styles.detailLabel}>Product Name</div>
-                    <div className={styles.detailValue}>{selectedProduct.name}</div>
-                  </div>
-                  <div className={styles.detailItem}>
-                    <div className={styles.detailLabel}>Shelf Location</div>
-                    <div className={styles.detailValue}>{selectedProduct.shelf}</div>
-                  </div>
-                  <div className={styles.detailItem}>
-                    <div className={styles.detailLabel}>Last Audit</div>
-                    <div className={styles.detailValue}>
-                      {formatTimestamp(selectedProduct.lastAudit)}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div className={styles.detailSection}>
-                <h3 className={styles.detailSectionTitle}>Stock Levels</h3>
-                <div className={styles.stockVisualization}>
-                  <div className={styles.stockCircle}>
-                    <svg width="180" height="180" viewBox="0 0 180 180">
-                      <circle
-                        cx="90"
-                        cy="90"
-                        r="70"
-                        fill="none"
-                        stroke="var(--color-bg-tertiary)"
-                        strokeWidth="20"
-                      />
-                      <circle
-                        cx="90"
-                        cy="90"
-                        r="70"
-                        fill="none"
-                        stroke={getStockColor(selectedProduct)}
-                        strokeWidth="20"
-                        strokeDasharray={`${2 * Math.PI * 70}`}
-                        strokeDashoffset={`${2 * Math.PI * 70 * (1 - getStockPercentage(selectedProduct) / 100)}`}
-                        transform="rotate(-90 90 90)"
-                      />
-                      <text
-                        x="90"
-                        y="85"
-                        textAnchor="middle"
-                        fontSize="32"
-                        fontWeight="700"
-                        fill="var(--color-text)"
-                      >
-                        {selectedProduct.currentStock}
-                      </text>
-                      <text
-                        x="90"
-                        y="105"
-                        textAnchor="middle"
-                        fontSize="14"
-                        fill="var(--color-text-secondary)"
-                      >
-                        units
-                      </text>
-                    </svg>
-                  </div>
-                  <div className={styles.stockMetrics}>
-                    <div className={styles.metric}>
-                      <div className={styles.metricLabel}>Current Stock</div>
-                      <div className={styles.metricValue}>{selectedProduct.currentStock}</div>
-                    </div>
-                    <div className={styles.metric}>
-                      <div className={styles.metricLabel}>Min Threshold</div>
-                      <div className={styles.metricValue}>{selectedProduct.minThreshold}</div>
-                    </div>
-                    <div className={styles.metric}>
-                      <div className={styles.metricLabel}>Max Capacity</div>
-                      <div className={styles.metricValue}>{selectedProduct.maxCapacity}</div>
-                    </div>
-                    <div className={styles.metric}>
-                      <div className={styles.metricLabel}>Fill Rate</div>
-                      <div className={styles.metricValue}>
-                        {getStockPercentage(selectedProduct).toFixed(0)}%
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div className={styles.detailActions}>
-                <button className={styles.btnPrimary}>Add Stock</button>
-                <button className={styles.btnSecondary}>Record Sale</button>
-                <button className={styles.btnSecondary}>Audit Shelf</button>
-              </div>
-            </>
-          ) : (
-            <div className={styles.emptyState}>
-              <div className={styles.emptyIcon}>📦</div>
-              <div className={styles.emptyText}>
-                Select a product to view details
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
+    <Modal
+      title={action === 'add' ? 'Add stock to shelf' : 'Record a sale'}
+      onClose={onClose}
+      onSubmit={() => valid && submit()}
+      footer={
+        <>
+          <button type="button" className="btn" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" className="btn btn-primary" disabled={!valid || saving}>
+            {saving && <span className="spinner" />}
+            {action === 'add' ? 'Add stock' : 'Record sale'}
+          </button>
+        </>
+      }
+    >
+      <p>
+        <strong>{product.name}</strong> <span className="mono muted">{product.sku}</span>
+      </p>
+      <label className="field">
+        <span className="field-label">Quantity</span>
+        <input
+          className="input"
+          type="number"
+          min={1}
+          max={max}
+          value={quantity}
+          onChange={(e) => setQuantity(Math.floor(Number(e.target.value)) || 0)}
+        />
+        <span className="field-hint">
+          {product.stock} → <strong className="num">{after}</strong> units
+          {action === 'add' && after > product.maxCapacity && ` (over capacity of ${product.maxCapacity})`}
+        </span>
+      </label>
+      {action === 'add' && (
+        <label className="field">
+          <span className="field-label">Shelf</span>
+          <input className="input mono" value={shelfLabel} onChange={(e) => setShelfLabel(e.target.value.toUpperCase())} placeholder="e.g. DAIRY-A1" />
+        </label>
+      )}
+      {error && <div className="form-error">{error}</div>}
+    </Modal>
   );
 };
 
