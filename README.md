@@ -9,6 +9,21 @@ Shelf photos ──►┘   + reconciliation       └──► Live dashboard (
                      engine (Postgres)
 ```
 
+
+### Screenshots
+
+![Dashboard: KPIs, alerts needing attention and shelf health](docs/1.png)
+
+![Alerts: active alerts by severity with status and details](docs/2.png)
+
+![Inventory: stock table with status filters per product](docs/3.png)
+
+![Vision AI: new shelf audit upload and audit history](docs/4.png)
+
+![Floor plan: shelves coloured by alert severity, cameras, tills and entrance](docs/5.png)
+
+---
+
 | Part | Stack |
 |---|---|
 | `backend/` | Node 20, Express, TypeScript, Prisma 5, PostgreSQL, OpenAI vision |
@@ -63,7 +78,6 @@ docker compose exec app npx prisma db seed   # optional demo data
 
 Everything updates **live**. The API pushes domain events over Server-Sent Events (`GET /api/events`), and pages refetch only what changed. New critical or high alerts also pop a toast on any page. Light and dark themes follow the OS until you choose one.
 
----
 
 ## How reconciliation works
 
